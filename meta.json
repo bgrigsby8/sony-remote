@@ -1,0 +1,28 @@
+{
+  "$schema": "https://dl.viam.dev/module.schema.json",
+  "module_id": "brad-grigsby:sony-remote",
+  "visibility": "public",
+  "url": "https://github.com/bgrigsby8/sony-remote",
+  "description": "Sony Camera Remote SDK camera: live view, direct-to-host RAW capture, absolute focus and exposure control over USB.",
+  "applications": null,
+  "markdown_link": "README.md",
+  "models": [
+    {
+      "api": "rdk:component:camera",
+      "model": "brad-grigsby:sony-remote:camera",
+      "markdown_link": "brad-grigsby_sony-remote_camera.md",
+      "short_description": "Sony A7R V (and other CrSDK bodies) over USB: live view, RAW capture direct to host, absolute focus position, exposure settings."
+    }
+  ],
+  "entrypoint": "dist/main",
+  "first_run": "",
+  "build": {
+    "build": "./build.sh",
+    "setup": "./setup.sh",
+    "path": "dist/archive.tar.gz",
+    "arch": [
+      "linux/amd64",
+      "linux/arm64"
+    ]
+  }
+}

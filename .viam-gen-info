@@ -1,0 +1,13 @@
+{
+  "module_name": "sony-remote",
+  "visibility": "public",
+  "namespace": "brad-grigsby",
+  "language": "python",
+  "resource_type": "component",
+  "resource_subtype": "camera",
+  "model_name": "camera",
+  "initialize_git": false,
+  "generator_version": "0.1.0",
+  "generated_on": "2026-08-06T14:41:42.218899Z",
+  "module_readme_link": "README.md"
+}
