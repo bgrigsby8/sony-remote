@@ -11,7 +11,7 @@
       "api": "rdk:component:camera",
       "model": "brad-grigsby:sony-remote:camera",
       "markdown_link": "brad-grigsby_sony-remote_camera.md",
-      "short_description": "Sony A7R V (and other CrSDK bodies) over USB: live view, RAW capture direct to host, absolute focus position, exposure settings."
+      "short_description": "Sony CrSDK cameras over USB: live view, direct-to-host RAW capture, focus and exposure control."
     }
   ],
   "entrypoint": "dist/main",
