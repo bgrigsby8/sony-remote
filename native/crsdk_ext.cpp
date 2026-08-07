@@ -40,6 +40,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
 #include <cstring>
 #include <deque>
 #include <map>
@@ -164,6 +165,10 @@ static std::atomic<bool> g_sdk_initialized{false};
 static std::atomic<bool> g_connected{false};
 static cr::CrDeviceHandle g_handle = 0;
 static cr::ICrEnumCameraObjectInfo* g_enum = nullptr;
+// From the enumeration info at connect time. GetDeviceProperties has no
+// model/serial property on every body, so this is the reliable source.
+static std::string g_model;
+static std::string g_serial;
 
 [[noreturn]] static void fail(const char* category, int code, const std::string& text) {
     throw std::runtime_error(std::string(category) + "|" + std::to_string(code) + "|" + text);
@@ -195,8 +200,9 @@ static const char* category_for(CrInt32u err) {
 
 static void check(CrInt32u err, const std::string& what) {
     if (err != cr::CrError_None) {
-        fail(category_for(err), static_cast<int>(err), what + " failed (CrError 0x" +
-                                                          std::to_string(err) + ")");
+        char code[16];
+        std::snprintf(code, sizeof code, "0x%04X", err);
+        fail(category_for(err), static_cast<int>(err), what + " failed (CrError " + code + ")");
     }
 }
 
@@ -467,6 +473,9 @@ static void ext_connect(int index, int timeout_ms) {
         err = cr::Connect(const_cast<cr::ICrCameraObjectInfo*>(info), &g_callback, &g_handle);
     }
     check(err, "Connect");
+    g_model = info->GetModel() ? std::string(info->GetModel()) : std::string();
+    g_serial = info->GetId() ? std::string(reinterpret_cast<const char*>(info->GetId()))
+                             : std::string();
     g_connected.store(true);
 }
 
@@ -577,13 +586,39 @@ static void ext_set_property(const std::string& name, py::object value) {
         raw = value.cast<uint64_t>();
     }
 
+    // The body rejects a set whose declared value type doesn't match the
+    // property's own (shutter_type came back 0x8402 when declared UInt32), so
+    // ask the camera what type it reports and echo that back - Sony's sample
+    // hardcodes the exact width per property for the same reason.
+    cr::CrDataType value_type = cr::CrDataType_UInt32;
+    {
+        py::gil_scoped_release unlock;
+        cr::CrDeviceProperty* props = nullptr;
+        CrInt32 count = 0;
+        if (cr::GetDeviceProperties(g_handle, &props, &count) == cr::CrError_None) {
+            for (CrInt32 i = 0; i < count; ++i) {
+                if (props[i].GetCode() == code) {
+                    value_type = props[i].GetValueType();
+                    break;
+                }
+            }
+            cr::ReleaseDeviceProperties(g_handle, props);
+        }
+    }
+    // The reported type may carry the array flavour (the choices list); the
+    // current value itself is always the scalar.
+    switch (value_type) {
+        case cr::CrDataType_UInt8Array: value_type = cr::CrDataType_UInt8; break;
+        case cr::CrDataType_UInt16Array: value_type = cr::CrDataType_UInt16; break;
+        case cr::CrDataType_UInt32Array: value_type = cr::CrDataType_UInt32; break;
+        case cr::CrDataType_UInt64Array: value_type = cr::CrDataType_UInt64; break;
+        default: break;
+    }
+
     cr::CrDeviceProperty prop;
     prop.SetCode(code);
     prop.SetCurrentValue(raw);
-    // The SDK requires the declared type to match what the body expects. All
-    // properties in kPropertyCodes are unsigned integers of at most 32 bits;
-    // UInt32 is accepted for the narrower ones.
-    prop.SetValueType(cr::CrDataType_UInt32);
+    prop.SetValueType(value_type);
 
     CrInt32u err = 0;
     {
@@ -713,8 +748,8 @@ static py::object ext_poll_event(int timeout_ms) {
 static py::dict ext_device_info() {
     require_connected();
     py::dict out;
-    out["model"] = std::string();
-    out["serial"] = std::string();
+    out["model"] = g_model;
+    out["serial"] = g_serial;
     out["battery_pct"] = py::none();
     out["lens"] = py::none();
 
