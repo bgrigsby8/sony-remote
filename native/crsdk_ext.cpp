@@ -466,7 +466,6 @@ static py::list ext_enumerate() {
 }
 
 static void ext_connect(int index, int timeout_ms) {
-    (void)timeout_ms;  // CrSDK's Connect is synchronous; the deadline is enforced in Python
     if (g_enum == nullptr) {
         fail("configuration", 0, "call enumerate() before connect()");
     }
@@ -477,15 +476,29 @@ static void ext_connect(int index, int timeout_ms) {
     CrInt32u err = 0;
     {
         py::gil_scoped_release unlock;
+        g_connected.store(false);
         // GetCameraObjectInfo returns const; Connect's signature never took the
         // const. Sony's own RemoteCli does the same cast.
         err = cr::Connect(const_cast<cr::ICrCameraObjectInfo*>(info), &g_callback, &g_handle);
     }
     check(err, "Connect");
+    // Connect() only starts the handshake - the session is usable when
+    // OnConnected fires (which sets g_connected). Property writes before that
+    // bounce with Api_InvalidCalled, so block here until the callback lands.
+    {
+        py::gil_scoped_release unlock;
+        std::unique_lock<std::mutex> lock(g_ev_mutex);
+        bool up = g_ev_cv.wait_for(
+            lock, std::chrono::milliseconds(timeout_ms > 0 ? timeout_ms : 10000),
+            [] { return g_connected.load(); });
+        if (!up) {
+            fail("disconnected", 0,
+                 "Connect was accepted but OnConnected did not arrive in time");
+        }
+    }
     g_model = info->GetModel() ? std::string(info->GetModel()) : std::string();
     g_serial = info->GetId() ? std::string(reinterpret_cast<const char*>(info->GetId()))
                              : std::string();
-    g_connected.store(true);
 }
 
 static void ext_disconnect() {
