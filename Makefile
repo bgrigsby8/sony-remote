@@ -40,7 +40,7 @@ ifndef CRSDK_ROOT
 	@echo '`"binding": "fake"` - it just cannot talk to a real camera.'
 	@exit 1
 else
-	$(PIP) install -qq pybind11
+	$(PIP) install -qq pybind11 setuptools
 	CRSDK_ROOT=$(CRSDK_ROOT) $(PYTHON) native/setup.py build_ext --inplace
 	@echo "built src/_crsdk*.so against $(CRSDK_ROOT)"
 endif
