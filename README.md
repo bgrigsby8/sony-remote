@@ -79,6 +79,22 @@ only when you opt in explicitly:
 CRSDK_BUNDLE_LIBS=1 CRSDK_ROOT=/path/to/sdk make build
 ```
 
+### Host prerequisites
+
+Linux caps userspace USB transfer buffers at **16MB** by default
+(`usbfs_memory_mb`). Live view fits under that; a 60-120MB A7R V RAW does not,
+and the failure is nasty: the transfer kills the USB session ~0.5s after the
+shutter, with no kernel USB event. Raise the cap:
+
+```bash
+echo 1000 | sudo tee /sys/module/usbcore/parameters/usbfs_memory_mb   # now
+# persist: add usbcore.usbfs_memory_mb=1000 to the kernel command line, or
+#   echo 'w /sys/module/usbcore/parameters/usbfs_memory_mb - - - - 1000' \
+#     | sudo tee /etc/tmpfiles.d/sony-crsdk.conf
+```
+
+The module checks at startup and logs a warning when the cap is too low.
+
 ### Platforms
 
 `linux/amd64` and `linux/arm64` are published. macOS is **not** — Sony does not

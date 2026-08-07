@@ -57,6 +57,13 @@ from store import CaptureStore, mime_for, primary_file
 _BACKOFF_START_S = 0.5
 _BACKOFF_MAX_S = 15.0
 
+# Linux caps userspace USB transfer buffers (usbfs) at 16MB by default. Live
+# view fits; a full-resolution RAW does not, and the failure mode is brutal to
+# diagnose: the transfer kills the PTP session ~0.5s after the shutter with no
+# kernel USB event. Checked at startup so the fix is one log line away.
+_USBFS_MEMORY_PATH = "/sys/module/usbcore/parameters/usbfs_memory_mb"
+_USBFS_MEMORY_MIN_MB = 256
+
 # One settle-and-retry for apply_on_connect writes the body reports as busy.
 # Observed on the A7R V: the first write after taking PC-remote priority
 # bounces with Api_InvalidCalled while the body digests the priority change;
@@ -348,7 +355,24 @@ class CameraSession:
     # Owner thread
     # ------------------------------------------------------------------
 
+    def _check_usbfs_memory(self) -> None:
+        try:
+            with open(_USBFS_MEMORY_PATH) as f:
+                cap_mb = int(f.read().strip())
+        except (OSError, ValueError):
+            return  # not Linux, or no usbcore - nothing to check
+        if cap_mb < _USBFS_MEMORY_MIN_MB:
+            self._log(
+                "warning",
+                f"usbfs memory cap is {cap_mb}MB - a full-resolution RAW "
+                f"transfer needs more, and WILL drop the USB session right "
+                f"after the shutter fires. Fix now: "
+                f"echo 1000 | sudo tee {_USBFS_MEMORY_PATH}  |  persist: "
+                f"usbcore.usbfs_memory_mb=1000 on the kernel command line",
+            )
+
     def _run(self) -> None:
+        self._check_usbfs_memory()
         try:
             self._binding.init()
         except Exception as exc:  # noqa: BLE001
