@@ -198,6 +198,13 @@ class Camera(CameraBase, EasyResource):
             apply_on_connect=dict(attrs.get("apply_on_connect") or {}),
         )
 
+        # Host checks only a real camera cares about; a fake-binding component
+        # must not nag about a machine it never touches.
+        if self._binding_kind == "native":
+            usbfs = crsdk_install.usbfs_warning()
+            if usbfs:
+                self.logger.warning(usbfs)
+
         # Operator-provided SDK archive: install Sony's runtime libraries into
         # /opt/sony-crsdk before the session first tries to import _crsdk.
         # Failure is logged, not fatal - the session still starts, and

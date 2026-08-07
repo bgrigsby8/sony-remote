@@ -70,6 +70,24 @@ class TestArchiveShapes:
         _assert_installed(target)
 
 
+class TestUsbfsWarning:
+    def test_low_cap_warns_with_the_fix(self, tmp_path):
+        knob = tmp_path / "usbfs_memory_mb"
+        knob.write_text("16\n")
+        message = crsdk_install.usbfs_warning(str(knob))
+        assert "16MB" in message
+        assert "usbcore.usbfs_memory_mb=1000" in message
+
+    def test_high_cap_is_silent(self, tmp_path):
+        knob = tmp_path / "usbfs_memory_mb"
+        knob.write_text("1000\n")
+        assert crsdk_install.usbfs_warning(str(knob)) is None
+
+    def test_no_knob_is_silent(self, tmp_path):
+        # macOS dev machines, containers without the sysfs file, ...
+        assert crsdk_install.usbfs_warning(str(tmp_path / "missing")) is None
+
+
 class TestFailureModes:
     def test_already_installed_is_a_noop(self, tmp_path, target):
         inner = tmp_path / "RemoteCli.zip"

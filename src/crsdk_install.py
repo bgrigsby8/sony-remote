@@ -29,6 +29,33 @@ from typing import Callable, Optional
 
 TARGET = "/opt/sony-crsdk"
 
+# Linux caps userspace USB transfer buffers (usbfs) at 16MB by default. Live
+# view fits; a full-resolution RAW does not, and the failure mode is brutal to
+# diagnose: the transfer kills the PTP session ~0.5s after the shutter with no
+# kernel USB event. first_run.sh raises the cap at install time; this check
+# covers machines where it couldn't (no root, cap reverted after a kernel
+# swap). Only meaningful for the native binding - the caller gates on that.
+_USBFS_MEMORY_PATH = "/sys/module/usbcore/parameters/usbfs_memory_mb"
+_USBFS_MEMORY_MIN_MB = 256
+
+
+def usbfs_warning(path: str = _USBFS_MEMORY_PATH) -> Optional[str]:
+    """A warning string when the usbfs cap is too low for RAW capture, else
+    None (including on hosts with no such knob)."""
+    try:
+        with open(path) as f:
+            cap_mb = int(f.read().strip())
+    except (OSError, ValueError):
+        return None
+    if cap_mb >= _USBFS_MEMORY_MIN_MB:
+        return None
+    return (
+        f"usbfs memory cap is {cap_mb}MB - a full-resolution RAW transfer "
+        f"needs more, and WILL drop the USB session right after the shutter "
+        f"fires. Fix now: echo 1000 | sudo tee {path}  |  persist: "
+        f"usbcore.usbfs_memory_mb=1000 on the kernel command line"
+    )
+
 #: The file whose presence means "already installed" - everything else
 #: (adapters, monitor libs) travels with it.
 _MARKER = "libCr_Core.so"
