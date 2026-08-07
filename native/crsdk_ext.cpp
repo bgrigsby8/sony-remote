@@ -678,10 +678,12 @@ static void ext_trigger_capture() {
     CrInt32u err = 0;
     {
         py::gil_scoped_release unlock;
-        // Down then Up on S2. The SDK models the shutter button as a held
-        // state; leaving it Down wedges the body until the next Up, so the two
-        // calls are kept adjacent and unconditional.
+        // Down, hold, Up on S2. The SDK models the shutter button as a held
+        // state: a zero-width press is ignored by the body, and Sony's
+        // RemoteCli holds for 35ms. Up is sent unconditionally - a body left
+        // Down wedges until the next Up.
         err = cr::SendCommand(g_handle, cr::CrCommandId_Release, cr::CrCommandParam_Down);
+        std::this_thread::sleep_for(std::chrono::milliseconds(35));
         if (err == cr::CrError_None) {
             err = cr::SendCommand(g_handle, cr::CrCommandId_Release, cr::CrCommandParam_Up);
         } else {
