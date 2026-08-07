@@ -9,11 +9,11 @@
 # libraries themselves - README, "Machine setup").
 #
 # Required repository secrets:
-#   CRSDK_ARCHIVE_URL    URL of CrSDK_v*_Linux64PC.zip in private storage
-#                        (private release asset, presigned bucket URL, ...).
-#   CRSDK_ARCHIVE_TOKEN  Bearer token for that URL, if it needs one.
-#   viam_key_id          Viam org API key id (already configured).
-#   viam_key_value       Viam org API key value (already configured).
+#   CRSDK_GH_REPO   Private repo holding the Sony SDK zip as a release asset,
+#                   e.g. "bgrigsby8/sony-crsdk-archive". Must stay private.
+#   CRSDK_GH_TOKEN  Fine-grained PAT with Contents: read on that repo only.
+#   viam_key_id     Viam org API key id (already configured).
+#   viam_key_value  Viam org API key value (already configured).
 
 on:
   push:
@@ -44,16 +44,18 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Fetch the Camera Remote SDK from private storage
+      - name: Fetch the Camera Remote SDK from the private archive repo
+        # Downloads the newest release's zip. To pin an SDK version instead,
+        # add the release tag after `download`.
         run: |
-          curl -fsSL ${CRSDK_ARCHIVE_TOKEN:+-H "Authorization: Bearer $CRSDK_ARCHIVE_TOKEN"} \
-            -o crsdk.zip "$CRSDK_ARCHIVE_URL"
+          gh release download --repo "$CRSDK_GH_REPO" \
+            --pattern '*Linux64PC.zip' --output crsdk.zip
           unzip -q crsdk.zip -d crsdk
           unzip -q crsdk/RemoteCli.zip -d crsdk/RemoteCli
           echo "CRSDK_ROOT=$PWD/crsdk/RemoteCli" >> "$GITHUB_ENV"
         env:
-          CRSDK_ARCHIVE_URL: ${{ secrets.CRSDK_ARCHIVE_URL }}
-          CRSDK_ARCHIVE_TOKEN: ${{ secrets.CRSDK_ARCHIVE_TOKEN }}
+          GH_TOKEN: ${{ secrets.CRSDK_GH_TOKEN }}
+          CRSDK_GH_REPO: ${{ secrets.CRSDK_GH_REPO }}
 
       - name: Build the module
         # No CRSDK_BUNDLE_LIBS: published artifacts never contain Sony's
