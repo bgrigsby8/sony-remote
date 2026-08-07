@@ -36,10 +36,22 @@ else
 fi
 
 if [ "$CRSDK_BUNDLE_LIBS" = "1" ] && [ -n "$CRSDK_ROOT" ]; then
-    for lib in $(find "$CRSDK_ROOT" -name 'libCr_*.so*' -o -name 'libmonitor_protocol*.so*' 2>/dev/null); do
-        echo "bundling $lib"
+    # Core libs sit at the payload root, next to the unpacked libCr_Core.
+    for lib in $(find "$CRSDK_ROOT" \( -name 'libCr_Core*.so*' -o -name 'libmonitor_protocol*.so*' \) -not -path '*/CrAdapter/*' 2>/dev/null); do
+        echo "bundling $lib -> ."
         EXTRA_ARGS="$EXTRA_ARGS --add-binary $lib:."
     done
+    # libCr_Core dlopens its adapters from a CrAdapter/ directory next to
+    # itself - inside a --onefile build that means next to the unpacked
+    # libCr_Core in _MEIPASS, so the subdirectory must be preserved. Take the
+    # whole directory: the PTP adapters need libusb/libssh2 riding along.
+    ADAPTER_DIR=$(find "$CRSDK_ROOT" -type d -name CrAdapter 2>/dev/null | head -n 1)
+    if [ -n "$ADAPTER_DIR" ]; then
+        for lib in "$ADAPTER_DIR"/*.so*; do
+            echo "bundling $lib -> CrAdapter/"
+            EXTRA_ARGS="$EXTRA_ARGS --add-binary $lib:CrAdapter"
+        done
+    fi
 fi
 
 $PYTHON -m PyInstaller --onefile --collect-all viam --hidden-import="googleapiclient" \
