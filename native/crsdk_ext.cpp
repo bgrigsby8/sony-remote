@@ -489,7 +489,15 @@ static void ext_connect(int index, int timeout_ms) {
         g_connected.store(false);
         // GetCameraObjectInfo returns const; Connect's signature never took the
         // const. Sony's own RemoteCli does the same cast.
-        err = cr::Connect(const_cast<cr::ICrCameraObjectInfo*>(info), &g_callback, &g_handle);
+        //
+        // Reconnecting_OFF is deliberate: the SDK's silent auto-reconnect
+        // resets camera-side session state (priority key, store destination)
+        // while Python still believes the old session is alive - observed on
+        // the A7R V as "first capture fires, transfer dies, every later
+        // trigger is ignored". With it off, a drop surfaces as OnDisconnected
+        // and session.py re-runs the full connect sequence.
+        err = cr::Connect(const_cast<cr::ICrCameraObjectInfo*>(info), &g_callback, &g_handle,
+                          cr::CrSdkControlMode_Remote, cr::CrReconnecting_OFF);
     }
     check(err, "Connect");
     // Connect() only starts the handshake - the session is usable when
