@@ -28,12 +28,10 @@
 // the C++ side to one helper and needs no registered exception type.
 //
 // ---------------------------------------------------------------------------
-// STATUS: written against the published CrSDK API shape, NOT yet compiled
-// against the real headers - the SDK download requires accepting Sony's licence
-// and the hardware is on order (see scope.md §8, §10). Expect the first `make
-// ext` against a real CRSDK_ROOT to need spelling fixes in the symbol tables and
-// the IDeviceCallback override list; that is the intended M1 task. Nothing above
-// this file changes when that happens.
+// STATUS: compiles and links against CrSDK v2.02.00 (Linux x64). Not yet
+// validated against a live body - SMOKE.md is the checklist for that. If a
+// future SDK bump renames symbols, the fixes belong in the tables below and
+// nothing above binding/interface.py changes.
 // ---------------------------------------------------------------------------
 
 #include <pybind11/pybind11.h>

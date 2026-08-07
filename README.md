@@ -212,12 +212,13 @@ checklist to run the day the camera arrives.
 
 ## Status
 
-`crsdk_ext.cpp` has been written against the published CrSDK API shape but has
-**not yet been compiled against the real headers** — the SDK download requires
-accepting Sony's licence and the hardware is on order. Expect the first
-`make ext` to need corrections in the symbol tables and the `IDeviceCallback`
-override list; that is the intended first task of M1. Nothing above
-`binding/interface.py` changes when it happens, and the test suite is unaffected.
+`crsdk_ext.cpp` compiles and links against **CrSDK v2.02.00 (Linux x64)**. The
+notable corrections from the first real compile: the still-file-format property
+is `CrDeviceProperty_FileType`, and S1 half-press is a device property
+(`CrDeviceProperty_S1` = `CrLockIndicator_Locked`), not a `SendCommand`.
+Validation against a live body is next — [`SMOKE.md`](SMOKE.md) is the
+checklist. Nothing above `binding/interface.py` changed, and the test suite is
+unaffected.
 
 ## Open questions
 
