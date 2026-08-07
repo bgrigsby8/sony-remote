@@ -63,6 +63,7 @@ _FLAT = (
     "set_settings",
     "get_status",
     "capture_count",
+    "dump_properties",
 )
 
 ALL_COMMANDS = _NESTED + _FLAT
@@ -265,6 +266,20 @@ class CommandHandler:
 
     async def _cmd_get_status(self, opts: Mapping[str, Any]) -> Dict[str, ValueTypes]:
         return await _to_thread(self._session.device_status)
+
+    async def _cmd_dump_properties(self, opts: Mapping[str, Any]) -> Dict[str, ValueTypes]:
+        """Diagnostic: the body's whole property table, hex-formatted.
+
+        Hex strings rather than numbers, both because that is how CrError.h
+        and CrDeviceProperty.h read, and because DoCommand numbers travel as
+        doubles, which would silently mangle 64-bit property values.
+        """
+        props = await _to_thread(self._session.dump_properties)
+
+        def _fmt(v: Any) -> Any:
+            return f"0x{v:X}" if isinstance(v, int) and not isinstance(v, bool) else v
+
+        return {"properties": [{k: _fmt(v) for k, v in p.items()} for p in props]}
 
     async def _cmd_capture_count(self, opts: Mapping[str, Any]) -> Dict[str, ValueTypes]:
         """Shutter actuations counted by this module, persisted in `capture_dir`.

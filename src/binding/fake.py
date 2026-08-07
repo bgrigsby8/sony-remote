@@ -236,6 +236,15 @@ class FakeCamera(CameraBinding):
         os.makedirs(directory, exist_ok=True)
         self.save_destination = directory
 
+    def dump_properties(self) -> List[Dict[str, Any]]:
+        self._require_connected()
+        # Codes are symbolic here where the real body reports numeric ones -
+        # this is a diagnostic view, not a wire format.
+        return [
+            {"code": name, "value": prop["value"], "enable": 1}
+            for name, prop in self._properties.items()
+        ]
+
     # ------------------------------------------------------------------
     # CameraBinding - properties
     # ------------------------------------------------------------------

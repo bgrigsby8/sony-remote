@@ -175,6 +175,9 @@ class NativeCamera(CameraBinding):
     def autofocus_once(self, timeout_s: float) -> bool:
         return bool(self._call("autofocus_once", int(timeout_s * 1000)))
 
+    def dump_properties(self) -> List[Dict[str, Any]]:
+        return [dict(p) for p in self._call("dump_properties")]
+
     # -- events --------------------------------------------------------
 
     def poll_event(self, timeout_s: float) -> Optional[Event]:

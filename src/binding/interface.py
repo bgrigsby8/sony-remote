@@ -265,6 +265,16 @@ class CameraBinding(ABC):
         other commands.
         """
 
+    def dump_properties(self) -> List[Dict[str, Any]]:
+        """Diagnostic: the body's whole property table, raw.
+
+        Each entry has at least `code` and `value` (plus whatever else the
+        implementation knows). Not part of the operating contract - it exists
+        because bring-up keeps coming down to "which session-side property is
+        in a state the camera's menu doesn't show". Default: nothing to report.
+        """
+        return []
+
     # -- events --------------------------------------------------------
 
     @abstractmethod

@@ -263,6 +263,9 @@ class CameraSession:
     def get_settings(self) -> Dict[str, Any]:
         return self._submit("get_settings", lambda: self._read_state(refresh=True)["settings"])
 
+    def dump_properties(self) -> List[Dict[str, Any]]:
+        return self._submit("dump_properties", self._binding.dump_properties)
+
     def set_settings(self, values: Dict[str, Any]) -> Dict[str, Any]:
         encoded = settings_mod.validate_all(values)  # raises before touching the camera
         return self._submit("set_settings", lambda: self._do_set_settings(encoded))

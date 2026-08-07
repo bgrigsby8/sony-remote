@@ -807,6 +807,34 @@ static py::dict ext_device_info() {
     return out;
 }
 
+// Diagnostic: the body's whole property table, raw. Bring-up has repeatedly
+// come down to "which session-side property is in a state the menu doesn't
+// show" - this answers all such questions in one call.
+static py::list ext_dump_properties() {
+    require_connected();
+    cr::CrDeviceProperty* props = nullptr;
+    CrInt32 count = 0;
+    CrInt32u err = 0;
+    {
+        py::gil_scoped_release unlock;
+        err = cr::GetDeviceProperties(g_handle, &props, &count);
+    }
+    check(err, "GetDeviceProperties");
+    py::list out;
+    for (CrInt32 i = 0; i < count; ++i) {
+        py::dict d;
+        d["code"] = static_cast<uint64_t>(props[i].GetCode());
+        d["value"] = static_cast<uint64_t>(props[i].GetCurrentValue());
+        d["enable"] = static_cast<int64_t>(props[i].GetPropertyEnableFlag());
+        d["value_type"] = static_cast<int64_t>(props[i].GetValueType());
+        out.append(d);
+    }
+    if (props != nullptr) {
+        cr::ReleaseDeviceProperties(g_handle, props);
+    }
+    return out;
+}
+
 PYBIND11_MODULE(_crsdk, m) {
     m.doc() = "Thin binding over the Sony Camera Remote SDK. No policy lives here.";
     m.def("init", &ext_init);
@@ -824,4 +852,5 @@ PYBIND11_MODULE(_crsdk, m) {
     m.def("trigger_capture", &ext_trigger_capture);
     m.def("autofocus_once", &ext_autofocus_once, py::arg("timeout_ms"));
     m.def("poll_event", &ext_poll_event, py::arg("timeout_ms"));
+    m.def("dump_properties", &ext_dump_properties);
 }
