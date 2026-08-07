@@ -589,7 +589,10 @@ class CameraSession:
             return
 
         if kind == EVENT_WARNING:
-            self._log("debug", f"camera warning: {event.data}")
+            # Body-initiated and rare; hex because that is how CrError.h reads.
+            value = event.data.get("value")
+            code = f"0x{int(value):X}" if isinstance(value, (int, float)) else value
+            self._log("warning", f"camera warning: {code}")
             return
 
         self._log("debug", f"unhandled camera event {kind!r}: {event.data}")
