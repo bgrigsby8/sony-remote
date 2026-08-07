@@ -173,8 +173,10 @@ class TestApplyOnConnect:
         session = make_session(fake, apply_on_connect={"aperture": "f/11"})
         assert wait_until(lambda: session.connected)
         assert fake.property_value("priority_key") == "PCRemote"
+        assert fake.property_value("store_destination") == "HostPC"
         names = [name for name, _ in fake.property_writes]
         assert names[0] == "priority_key"
+        assert names[1] == "store_destination"
         assert "f_number" in names
 
     def test_a_busy_body_gets_one_settle_and_retry(self, make_session, fake, logger):

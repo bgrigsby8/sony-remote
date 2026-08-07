@@ -430,6 +430,20 @@ class CameraSession:
                     f"could not take PC-remote priority; settings may be "
                     f"read-only from here: {exc}",
                 )
+            # The camera menu has an equivalent setting, but the SDK session
+            # acts on the property - without HostPC here the exposure happens
+            # and the image strands in the body's buffer, wedging later shots.
+            try:
+                self._retry_busy(
+                    lambda: self._binding.set_property("store_destination", "HostPC")
+                )
+            except CameraError as exc:
+                self._log(
+                    "warning",
+                    f"could not set the still-image store destination to the "
+                    f"host; captures may strand in the body or go to the card: "
+                    f"{exc}",
+                )
             self._apply_on_connect()
             try:
                 self._device = dict(self._binding.device_info())

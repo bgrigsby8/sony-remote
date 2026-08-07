@@ -77,6 +77,12 @@ _DEFAULT_PROPERTIES: Dict[str, Dict[str, Any]] = {
     # Real bodies boot owning their own settings; remote sets bounce until the
     # session takes PCRemote priority (which it does right after connect).
     "priority_key": {"value": "CameraPosition", "choices": ["CameraPosition", "PCRemote"]},
+    # The SDK session acts on this property regardless of the camera menu's
+    # equivalent; direct-to-host saving requires HostPC.
+    "store_destination": {
+        "value": "MemoryCard",
+        "choices": ["HostPC", "MemoryCard", "HostPCAndMemoryCard"],
+    },
 }
 
 

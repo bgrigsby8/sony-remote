@@ -85,6 +85,10 @@ static const std::map<std::string, cr::CrDevicePropertyCode> kPropertyCodes = {
     // the dials, in which state remote sets are rejected (Api_InvalidCalled)
     // or silently ignored. session.py takes PCRemote right after connect.
     {"priority_key", cr::CrDeviceProperty_PriorityKeySettings},
+    // Where stills go. The camera menu has an equivalent, but the SDK session
+    // acts on THIS property - direct-to-host saving needs HostPC set here, or
+    // the exposure happens and the image strands in the body's buffer.
+    {"store_destination", cr::CrDeviceProperty_StillImageStoreDestination},
 };
 
 // Symbolic value <-> SDK enum, for the properties whose values are enums rather
@@ -131,6 +135,12 @@ static const std::map<std::string, std::map<std::string, uint64_t>> kEnumValues 
      {
          {"CameraPosition", cr::CrPriorityKey_CameraPosition},
          {"PCRemote", cr::CrPriorityKey_PCRemote},
+     }},
+    {"store_destination",
+     {
+         {"HostPC", cr::CrStillImageStoreDestination_HostPC},
+         {"MemoryCard", cr::CrStillImageStoreDestination_MemoryCard},
+         {"HostPCAndMemoryCard", cr::CrStillImageStoreDestination_HostPCAndMemoryCard},
      }},
 };
 
