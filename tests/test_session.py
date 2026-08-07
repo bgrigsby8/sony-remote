@@ -177,6 +177,19 @@ class TestApplyOnConnect:
         assert names[0] == "priority_key"
         assert "f_number" in names
 
+    def test_a_busy_body_gets_one_settle_and_retry(self, make_session, fake, logger):
+        # The A7R V rejects the first write fired too soon after the handshake
+        # with a busy-class error, then accepts the same write moments later.
+        # One retry must absorb that instead of losing the priority key or
+        # recording a phantom apply error.
+        fake.busy_once = True
+        session = make_session(fake, apply_on_connect={"aperture": "f/11"})
+        assert wait_until(lambda: session.connected)
+        assert session.device_status()["apply_errors"] == []
+        assert fake.property_value("priority_key") == "PCRemote"
+        assert fake.property_value("f_number") == 1100
+        assert "could not take PC-remote priority" not in logger.text("warning")
+
     def test_mechanical_shutter_is_the_default(self, make_session, fake):
         # The rig fires a strobe; the electronic shutter's rolling readout would
         # light only part of the frame.

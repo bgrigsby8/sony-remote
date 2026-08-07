@@ -57,6 +57,12 @@ from store import CaptureStore, mime_for, primary_file
 _BACKOFF_START_S = 0.5
 _BACKOFF_MAX_S = 15.0
 
+# One settle-and-retry for apply_on_connect writes the body reports as busy.
+# Observed on the A7R V: the first write after taking PC-remote priority
+# bounces with Api_InvalidCalled while the body digests the priority change;
+# the same write succeeds moments later.
+_APPLY_RETRY_DELAY_S = 1.0
+
 # How long the owner thread parks on the job queue when it has nothing to do.
 # Also the ceiling on how long a disconnect event sits unnoticed, since events
 # are drained on the same tick. 50ms is imperceptible to an operator and costs
@@ -415,7 +421,9 @@ class CameraSession:
             # silently ignored. Non-fatal like every apply: a body that
             # refuses still connects, and apply_errors will say what stuck.
             try:
-                self._binding.set_property("priority_key", "PCRemote")
+                self._retry_busy(
+                    lambda: self._binding.set_property("priority_key", "PCRemote")
+                )
             except CameraError as exc:
                 self._log(
                     "warning",
@@ -507,7 +515,7 @@ class CameraSession:
         for key, value in wanted.items():
             try:
                 raw = settings_mod.validate(key, value)
-                self._set_property(key, raw)
+                self._retry_busy(lambda: self._set_property(key, raw))
                 self._log("debug", f"apply_on_connect: {key} = {value!r}")
             except CameraError as exc:
                 detail = f"{key}={value!r}: {exc.message}"
@@ -866,6 +874,20 @@ class CameraSession:
     # ------------------------------------------------------------------
     # Property helpers - owner thread only
     # ------------------------------------------------------------------
+
+    def _retry_busy(self, write: Callable[[], None]) -> None:
+        """One settle-and-retry for a write the body reports as busy.
+
+        Observed on the A7R V during the connect sequence: a write fired too
+        soon after the handshake or the priority-key change bounces with
+        Api_InvalidCalled (busy category), and the same write succeeds moments
+        later. Anything still busy after the settle is a real error.
+        """
+        try:
+            write()
+        except BusyError:
+            time.sleep(_APPLY_RETRY_DELAY_S)
+            write()
 
     def _set_property(self, key: str, raw: Any) -> None:
         """Write one setting, turning a rejection into an actionable error.
