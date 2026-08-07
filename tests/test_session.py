@@ -166,6 +166,17 @@ class TestApplyOnConnect:
         assert fake.property_value("still_file_format") == "RAW"
         assert fake.property_value("shutter_type") == "Mechanical"
 
+    def test_pc_remote_priority_is_taken_before_any_setting(self, make_session, fake):
+        # A real body boots owning its shooting settings and rejects (or
+        # silently ignores) remote sets until the PC takes priority - so the
+        # priority write must land first, or the whole recipe bounces.
+        session = make_session(fake, apply_on_connect={"aperture": "f/11"})
+        assert wait_until(lambda: session.connected)
+        assert fake.property_value("priority_key") == "PCRemote"
+        names = [name for name, _ in fake.property_writes]
+        assert names[0] == "priority_key"
+        assert "f_number" in names
+
     def test_mechanical_shutter_is_the_default(self, make_session, fake):
         # The rig fires a strobe; the electronic shutter's rolling readout would
         # light only part of the frame.

@@ -81,6 +81,10 @@ static const std::map<std::string, cr::CrDevicePropertyCode> kPropertyCodes = {
     {"shutter_type", cr::CrDeviceProperty_ShutterType},
     {"battery_level", cr::CrDeviceProperty_BatteryRemain},
     {"lens_model", cr::CrDeviceProperty_LensModelName},
+    // Who owns the shooting settings: the body's dials or the PC. Defaults to
+    // the dials, in which state remote sets are rejected (Api_InvalidCalled)
+    // or silently ignored. session.py takes PCRemote right after connect.
+    {"priority_key", cr::CrDeviceProperty_PriorityKeySettings},
 };
 
 // Symbolic value <-> SDK enum, for the properties whose values are enums rather
@@ -122,6 +126,11 @@ static const std::map<std::string, std::map<std::string, uint64_t>> kEnumValues 
          {"AF_A", cr::CrFocus_AF_A},
          {"DMF", cr::CrFocus_DMF},
          {"MF", cr::CrFocus_MF},
+     }},
+    {"priority_key",
+     {
+         {"CameraPosition", cr::CrPriorityKey_CameraPosition},
+         {"PCRemote", cr::CrPriorityKey_PCRemote},
      }},
 };
 
@@ -605,15 +614,9 @@ static void ext_set_property(const std::string& name, py::object value) {
             cr::ReleaseDeviceProperties(g_handle, props);
         }
     }
-    // The reported type may carry the array flavour (the choices list); the
-    // current value itself is always the scalar.
-    switch (value_type) {
-        case cr::CrDataType_UInt8Array: value_type = cr::CrDataType_UInt8; break;
-        case cr::CrDataType_UInt16Array: value_type = cr::CrDataType_UInt16; break;
-        case cr::CrDataType_UInt32Array: value_type = cr::CrDataType_UInt32; break;
-        case cr::CrDataType_UInt64Array: value_type = cr::CrDataType_UInt64; break;
-        default: break;
-    }
+    // Echo the reported type back VERBATIM, array flavour included - Sony's
+    // sample sets PriorityKeySettings as UInt32Array even though the enum is
+    // 16-bit, so demoting arrays to scalars is exactly the wrong move.
 
     cr::CrDeviceProperty prop;
     prop.SetCode(code);

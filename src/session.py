@@ -410,6 +410,18 @@ class CameraSession:
             self._binding.set_save_destination(self._config.capture_dir)
             self._connected = True
             self._state_cache = None
+            # The body boots owning its shooting settings; until the PC takes
+            # priority, remote sets are rejected (Api_InvalidCalled) or
+            # silently ignored. Non-fatal like every apply: a body that
+            # refuses still connects, and apply_errors will say what stuck.
+            try:
+                self._binding.set_property("priority_key", "PCRemote")
+            except CameraError as exc:
+                self._log(
+                    "warning",
+                    f"could not take PC-remote priority; settings may be "
+                    f"read-only from here: {exc}",
+                )
             self._apply_on_connect()
             try:
                 self._device = dict(self._binding.device_info())

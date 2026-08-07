@@ -74,6 +74,9 @@ _DEFAULT_PROPERTIES: Dict[str, Dict[str, Any]] = {
     "still_file_format": {"value": "RAW", "choices": ["RAW", "RAW_JPEG", "JPEG"]},
     "focus_mode": {"value": "MF", "choices": ["AF_S", "AF_C", "DMF", "MF"]},
     "focus_position": {"value": 128, "choices": []},
+    # Real bodies boot owning their own settings; remote sets bounce until the
+    # session takes PCRemote priority (which it does right after connect).
+    "priority_key": {"value": "CameraPosition", "choices": ["CameraPosition", "PCRemote"]},
 }
 
 
