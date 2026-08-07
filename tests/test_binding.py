@@ -12,6 +12,7 @@ hardware smoke checklist (SMOKE.md), per scope.md §7.
 """
 
 import inspect
+import sys
 
 import pytest
 
@@ -107,7 +108,11 @@ class TestMakeBinding:
 
 
 class TestNativeWithoutTheSdk:
-    def test_a_missing_extension_is_an_actionable_configuration_error(self):
+    def test_a_missing_extension_is_an_actionable_configuration_error(self, monkeypatch):
+        # Force the import to fail even on a machine where `make ext` has been
+        # run (None in sys.modules makes `import _crsdk` raise ImportError) -
+        # what's under test is the error message, not the machine's state.
+        monkeypatch.setitem(sys.modules, "_crsdk", None)
         camera = NativeCamera()
         with pytest.raises(ConfigurationError) as exc:
             camera.init()
