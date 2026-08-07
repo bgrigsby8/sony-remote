@@ -70,7 +70,7 @@ static const std::map<std::string, cr::CrDevicePropertyCode> kPropertyCodes = {
     {"shutter_speed", cr::CrDeviceProperty_ShutterSpeed},
     {"iso_sensitivity", cr::CrDeviceProperty_IsoSensitivity},
     {"white_balance", cr::CrDeviceProperty_WhiteBalance},
-    {"still_file_format", cr::CrDeviceProperty_StillFileFormat},
+    {"still_file_format", cr::CrDeviceProperty_FileType},
     {"exposure_program_mode", cr::CrDeviceProperty_ExposureProgramMode},
     {"focus_mode", cr::CrDeviceProperty_FocusMode},
     // Absolute focus. scope.md §10 Q3: confirm this exists on ILCE-7RM5 in the
@@ -91,16 +91,16 @@ static const std::map<std::string, cr::CrDevicePropertyCode> kPropertyCodes = {
 static const std::map<std::string, std::map<std::string, uint64_t>> kEnumValues = {
     {"white_balance",
      {
-         {"AWB", cr::CrWhiteBalanceSetting_AWB},
-         {"Daylight", cr::CrWhiteBalanceSetting_Daylight},
-         {"Shade", cr::CrWhiteBalanceSetting_Shadow},
-         {"Cloudy", cr::CrWhiteBalanceSetting_Cloudy},
-         {"Incandescent", cr::CrWhiteBalanceSetting_Incandescent},
-         {"Fluorescent", cr::CrWhiteBalanceSetting_Fluorescent_WarmWhite},
-         {"Flash", cr::CrWhiteBalanceSetting_Flush},  // sic - Sony spells it "Flush"
-         {"Underwater", cr::CrWhiteBalanceSetting_Underwater_Auto},
-         {"ColorTemp", cr::CrWhiteBalanceSetting_ColorTemp},
-         {"Custom1", cr::CrWhiteBalanceSetting_Custom_1},
+         {"AWB", cr::CrWhiteBalance_AWB},
+         {"Daylight", cr::CrWhiteBalance_Daylight},
+         {"Shade", cr::CrWhiteBalance_Shadow},
+         {"Cloudy", cr::CrWhiteBalance_Cloudy},
+         {"Incandescent", cr::CrWhiteBalance_Tungsten},
+         {"Fluorescent", cr::CrWhiteBalance_Fluorescent_WarmWhite},
+         {"Flash", cr::CrWhiteBalance_Flush},  // sic - Sony spells it "Flush"
+         {"Underwater", cr::CrWhiteBalance_Underwater_Auto},
+         {"ColorTemp", cr::CrWhiteBalance_ColorTemp},
+         {"Custom1", cr::CrWhiteBalance_Custom_1},
      }},
     {"shutter_type",
      {
@@ -110,19 +110,19 @@ static const std::map<std::string, std::map<std::string, uint64_t>> kEnumValues 
      }},
     {"still_file_format",
      {
-         {"RAW", cr::CrFileFormat_Raw},
-         {"RAW_JPEG", cr::CrFileFormat_RawJpeg},
-         {"JPEG", cr::CrFileFormat_Jpeg},
-         {"RAW_HEIF", cr::CrFileFormat_RawHeif},
-         {"HEIF", cr::CrFileFormat_Heif},
+         {"RAW", cr::CrFileType_Raw},
+         {"RAW_JPEG", cr::CrFileType_RawJpeg},
+         {"JPEG", cr::CrFileType_Jpeg},
+         {"RAW_HEIF", cr::CrFileType_RawHeif},
+         {"HEIF", cr::CrFileType_Heif},
      }},
     {"focus_mode",
      {
-         {"AF_S", cr::CrFocusMode_AF_S},
-         {"AF_C", cr::CrFocusMode_AF_C},
-         {"AF_A", cr::CrFocusMode_AF_A},
-         {"DMF", cr::CrFocusMode_DMF},
-         {"MF", cr::CrFocusMode_MF},
+         {"AF_S", cr::CrFocus_AF_S},
+         {"AF_C", cr::CrFocus_AF_C},
+         {"AF_A", cr::CrFocus_AF_A},
+         {"DMF", cr::CrFocus_DMF},
+         {"MF", cr::CrFocus_MF},
      }},
 };
 
@@ -185,10 +185,10 @@ static const char* category_for(CrInt32u err) {
         case cr::CrError_Connect_TimeOut:
             return "disconnected";
         case cr::CrError_Api_InvalidCalled:
-        case cr::CrError_Adaptor_Busy:
+        case cr::CrError_Connect_FailBusy:
+        case cr::CrError_Adaptor_DeviceBusy:
             return "busy";
         case cr::CrError_Api_OutOfModelList:
-        case cr::CrError_Api_InvalidSetValue:
             return "unsupported";
         default:
             return "sdk";
@@ -261,16 +261,12 @@ class Callback : public cr::IDeviceCallback {
 
     void OnNotifyContentsTransfer(CrInt32u notify, cr::CrContentHandle handle,
                                   CrChar* filename) override {
+        // Contents-transfer (pull) mode is never entered by this module -
+        // stills arrive direct-to-host via OnCompleteDownload above. Surfacing
+        // these would double-report files if the mode were ever enabled.
+        (void)notify;
         (void)handle;
-        if (notify != cr::CrNotify_ContentsTransfer_Done) {
-            return;
-        }
-        Ev ev;
-        ev.kind = "file_written";
-        if (filename != nullptr) {
-            ev.path = to_utf8(filename);
-        }
-        push_event(ev);
+        (void)filename;
     }
 
     void OnWarning(CrInt32u warning) override {
@@ -468,7 +464,9 @@ static void ext_connect(int index, int timeout_ms) {
     CrInt32u err = 0;
     {
         py::gil_scoped_release unlock;
-        err = cr::Connect(info, &g_callback, &g_handle);
+        // GetCameraObjectInfo returns const; Connect's signature never took the
+        // const. Sony's own RemoteCli does the same cast.
+        err = cr::Connect(const_cast<cr::ICrCameraObjectInfo*>(info), &g_callback, &g_handle);
     }
     check(err, "Connect");
     g_connected.store(true);
@@ -543,8 +541,8 @@ static py::dict ext_get_property(const std::string& name) {
         // GetPropertyEnableFlag() distinguishes "readable" from "settable right
         // now" - focus_position is read-only while the lens is in AF, which is
         // exactly the case set_focus_position has to detect and correct.
-        out["writable"] = props[i].GetPropertyEnableFlag() == cr::CrEnableValue_Enable ||
-                          props[i].GetPropertyEnableFlag() == cr::CrEnableValue_True;
+        out["writable"] = props[i].GetPropertyEnableFlag() == cr::CrEnableValue_True ||
+                          props[i].GetPropertyEnableFlag() == cr::CrEnableValue_SetOnly;
         break;
     }
     if (props != nullptr) {
@@ -646,11 +644,19 @@ static void ext_trigger_capture() {
 
 static bool ext_autofocus_once(int timeout_ms) {
     require_connected();
+    // Half-press is a device *property* (S1 = LockIndicator), not a
+    // SendCommand - this mirrors Sony's own RemoteCli sample.
+    auto set_s1 = [](bool down) {
+        cr::CrDeviceProperty prop;
+        prop.SetCode(cr::CrDeviceProperty_S1);
+        prop.SetCurrentValue(down ? cr::CrLockIndicator_Locked : cr::CrLockIndicator_Unlocked);
+        prop.SetValueType(cr::CrDataType_UInt16);
+        return cr::SetDeviceProperty(g_handle, &prop);
+    };
     bool acquired = false;
     {
         py::gil_scoped_release unlock;
-        CrInt32u err =
-            cr::SendCommand(g_handle, cr::CrCommandId_S1Shooting, cr::CrCommandParam_Down);
+        CrInt32u err = set_s1(true);
         if (err == cr::CrError_None) {
             // The body reports focus state through a property, not an event, so
             // this polls. Half-press is released on every path, including the
@@ -662,10 +668,10 @@ static bool ext_autofocus_once(int timeout_ms) {
                 CrInt32 count = 0;
                 if (cr::GetDeviceProperties(g_handle, &props, &count) == cr::CrError_None) {
                     for (CrInt32 i = 0; i < count; ++i) {
-                        if (props[i].GetCode() == cr::CrDeviceProperty_FocusIndicator) {
+                        if (props[i].GetCode() == cr::CrDeviceProperty_FocusIndication) {
                             auto v = props[i].GetCurrentValue();
-                            acquired = (v == cr::CrFocusIndicator_Focuslocked_Solid ||
-                                        v == cr::CrFocusIndicator_AFLock_Solid);
+                            acquired = (v == cr::CrFocusIndicator_Focused_AF_S ||
+                                        v == cr::CrFocusIndicator_Focused_AF_C);
                         }
                     }
                     cr::ReleaseDeviceProperties(g_handle, props);
@@ -676,7 +682,7 @@ static bool ext_autofocus_once(int timeout_ms) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(50));
             }
         }
-        cr::SendCommand(g_handle, cr::CrCommandId_S1Shooting, cr::CrCommandParam_Up);
+        set_s1(false);
     }
     return acquired;
 }
@@ -728,7 +734,7 @@ static py::dict ext_device_info() {
         if (code == cr::CrDeviceProperty_BatteryRemain) {
             out["battery_pct"] = static_cast<int>(props[i].GetCurrentValue());
         } else if (code == cr::CrDeviceProperty_LensModelName) {
-            auto* raw = static_cast<char*>(props[i].GetValues());
+            auto* raw = reinterpret_cast<const char*>(props[i].GetValues());
             if (raw != nullptr) {
                 out["lens"] = std::string(raw, props[i].GetValueSize());
             }
