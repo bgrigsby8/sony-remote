@@ -414,8 +414,8 @@ static void ext_init() {
     if (!ok) {
         fail("configuration", 0,
              "SCRSDK::Init() returned false - the CrSDK shared libraries are present but "
-             "refused to initialise; check that the adapter .so files are in the directory "
-             "the loader searches");
+             "refused to initialise; check that the CrAdapter directory sits next to "
+             "libCr_Core.so (deployed machines: both under /opt/sony-crsdk)");
     }
     g_sdk_initialized.store(true);
 }

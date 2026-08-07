@@ -57,27 +57,42 @@ make ext                                               # builds src/_crsdk*.so
 `app/CRSDK/`) and the shared libraries (`libCr_Core.so` and friends).
 `make ext` without it prints these instructions and exits.
 
-### Runtime library placement
+### Machine setup (per deployed machine, one time)
 
-`libCr_Core` **dlopen's its adapter libraries from the directory next to the
-running executable**, not from `LD_LIBRARY_PATH`. On the machine running
-viam-server, that means the CrSDK `.so` files must sit alongside the unpacked
-module binary. If the module starts but every command reports
+Sony's licence does not permit redistributing the SDK's shared libraries, so
+they are **not** inside the module tarball. Each machine provides them at the
+conventional path `/opt/sony-crsdk` (the extension's rpath looks there):
+
+```bash
+# 1. Download the Camera Remote SDK from Sony (registration + licence
+#    acceptance), copy the zip to the machine, then:
+cd ~ && unzip CrSDK_v*_Linux64PC.zip -d sony && cd sony && unzip RemoteCli.zip -d RemoteCli
+
+# 2. Install the runtime libraries where the module expects them:
+sudo mkdir -p /opt/sony-crsdk
+sudo cp -r RemoteCli/external/crsdk/. /opt/sony-crsdk/
+```
+
+That's the whole host-side install: `/opt/sony-crsdk` ends up holding
+`libCr_Core.so`, `libmonitor_protocol*.so` and the `CrAdapter/` directory
+(whose location next to `libCr_Core` is load-bearing - `libCr_Core` dlopens
+its adapters relative to itself, not via `LD_LIBRARY_PATH`). The usbfs memory
+cap (see Host prerequisites) is handled automatically by the module's
+`first_run` script.
+
+If the module starts but every command reports
 
 ```
 [configuration] the `_crsdk` extension is not importable ...
 ```
 
-that is what to check first. `{"get_status": {}}` reports the same thing in
-`last_error`, so it is visible from the webapp without reading logs.
+the libraries aren't at `/opt/sony-crsdk` (or aren't readable). The same text
+shows up in `{"get_status": {}}` under `last_error`, so it is visible from the
+webapp without reading logs.
 
-Whether those libraries may ship *inside* the module tarball is
-[open question 1](#open-questions). Until it's settled, `build.sh` bundles them
-only when you opt in explicitly:
-
-```bash
-CRSDK_BUNDLE_LIBS=1 CRSDK_ROOT=/path/to/sdk make build
-```
+For development only, `build.sh` can bundle the libraries into a local build
+with `CRSDK_BUNDLE_LIBS=1 CRSDK_ROOT=/path/to/sdk make build` - never publish
+such an artifact; that is redistribution.
 
 ### Host prerequisites
 
@@ -240,11 +255,11 @@ unaffected.
 
 Tracked from `scope.md` §10; none of them block bring-up.
 
-1. **CrSDK redistribution.** May the `.so` files ship inside a Viam registry
-   module for private org distribution? Read the licence text in the download.
-   Until answered, `build.sh` bundles them only under `CRSDK_BUNDLE_LIBS=1`, the
-   module is `"visibility": "private"` in `meta.json`, and the runtime error
-   points an operator at where to put the libraries by hand.
+1. **CrSDK redistribution - ANSWERED (2026-08-07): we don't.** Sony's licence
+   is treated as prohibiting redistribution, so published artifacts never
+   contain Sony's `.so` files. Each machine installs them at `/opt/sony-crsdk`
+   (see "Machine setup"); `CRSDK_BUNDLE_LIBS=1` remains as a local-development
+   convenience only.
 2. **CI SDK storage.** Private GitHub release asset vs. publishing only from a
    build machine that already has the SDK. Until then CI runs the test suite
    (which needs neither) and `make publish` is local.

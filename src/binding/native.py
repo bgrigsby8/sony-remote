@@ -49,10 +49,11 @@ _ERROR_CLASSES = {
 }
 
 _IMPORT_HINT = (
-    "the `_crsdk` extension is not importable. Build it with `make ext` after "
-    "setting CRSDK_ROOT to the extracted Sony Camera Remote SDK, and make sure "
-    "the SDK's shared libraries are on the loader path (LD_LIBRARY_PATH on "
-    "Linux, DYLD_LIBRARY_PATH on macOS) - see README.md, 'SDK acquisition'"
+    "the `_crsdk` extension is not importable. On a deployed machine this "
+    "almost always means the Sony SDK libraries are missing: download the SDK "
+    "from Sony (licence acceptance required) and copy external/crsdk into "
+    "/opt/sony-crsdk - see README.md, 'Machine setup'. On a build machine: "
+    "run `make ext` with CRSDK_ROOT set to the extracted SDK"
 )
 
 

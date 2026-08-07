@@ -70,7 +70,13 @@ if not library_dirs:  # pragma: no cover - build-time only
 # adapter .so) are dlopen'd by Cr_Core at runtime from the directory *next to
 # the executable*, not from LD_LIBRARY_PATH. rpath covers the link-time libs;
 # README documents the runtime placement, which no build flag can fix.
-extra_link_args = [f"-Wl,-rpath,{library_dirs[0]}"]
+# Three rpath entries, in the order the loader tries them:
+#   1. the build machine's SDK dir (dev convenience),
+#   2. /opt/sony-crsdk - THE deployment convention: operators copy the SDK's
+#      external/crsdk contents there and the module finds them without any
+#      env or config (README, "Machine setup"),
+#   3. next to the extension itself, for bundled builds.
+extra_link_args = [f"-Wl,-rpath,{library_dirs[0]}", "-Wl,-rpath,/opt/sony-crsdk"]
 if sys.platform == "darwin":
     extra_link_args += ["-Wl,-rpath,@loader_path"]
 else:
