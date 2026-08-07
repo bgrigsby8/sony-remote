@@ -1,0 +1,71 @@
+# Publish a release to the Viam registry.
+#
+# The Sony Camera Remote SDK cannot live in this repository (Sony's licence
+# prohibits redistribution), so the build fetches it at publish time from
+# PRIVATE storage the org controls. Required repository secrets:
+#
+#   CRSDK_ARCHIVE_URL    URL of the CrSDK_v*_Linux64PC.zip in private storage
+#                        (private release asset, presigned bucket URL, ...).
+#                        Never a public location.
+#   CRSDK_ARCHIVE_TOKEN  Bearer token for that URL, if it needs one.
+#   VIAM_KEY_ID          Viam org API key id (module upload rights).
+#   VIAM_KEY_VALUE       Viam org API key value.
+#
+# Trigger: publishing a GitHub release with a semver tag (v0.1.0 -> 0.1.0).
+
+name: Deploy to Viam registry
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Run the hardware-free suite
+        run: |
+          make setup
+          make test
+
+  publish:
+    needs: test
+    runs-on: ubuntu-latest   # linux/amd64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Fetch the Camera Remote SDK from private storage
+        run: |
+          curl -fsSL ${CRSDK_ARCHIVE_TOKEN:+-H "Authorization: Bearer $CRSDK_ARCHIVE_TOKEN"} \
+            -o crsdk.zip "$CRSDK_ARCHIVE_URL"
+          unzip -q crsdk.zip -d crsdk
+          unzip -q crsdk/RemoteCli.zip -d crsdk/RemoteCli
+          echo "CRSDK_ROOT=$PWD/crsdk/RemoteCli" >> "$GITHUB_ENV"
+        env:
+          CRSDK_ARCHIVE_URL: ${{ secrets.CRSDK_ARCHIVE_URL }}
+          CRSDK_ARCHIVE_TOKEN: ${{ secrets.CRSDK_ARCHIVE_TOKEN }}
+
+      - name: Build the module
+        # No CRSDK_BUNDLE_LIBS: published artifacts never contain Sony's
+        # libraries. Machines provide them at /opt/sony-crsdk (README,
+        # "Machine setup").
+        run: |
+          make setup
+          make ext
+          make build
+
+      - name: Upload to the Viam registry
+        uses: viamrobotics/upload-module@v1
+        with:
+          module-path: dist/archive.tar.gz
+          platform: linux/amd64
+          version: ${{ github.ref_name }}
+          key-id: ${{ secrets.VIAM_KEY_ID }}
+          key-value: ${{ secrets.VIAM_KEY_VALUE }}

@@ -14,16 +14,15 @@ That nesting is not a style choice - `color-correction` does
 ``source_resp.get("capture", source_resp)`` and then ``capture.get("saved_to")
 or capture.get("path")``, and its deferred pipeline calls ``trigger`` then
 ``download``. Matching the shape is what lets `color-correction` wrap this
-module with no changes at all (scope.md §2.5).
+module with no changes at all.
 
 **New commands** (`get_focus_position`, `set_focus_position`, `autofocus_once`,
-`get_settings`, `set_settings`, `get_status`, `capture_count`) answer flat, in
-the shapes scope.md §5 specifies:
+`get_settings`, `set_settings`, `get_status`, `capture_count`) answer flat:
 
     {"get_focus_position": {}}  ->  {"position": 1234, "units": "sdk_raw"}
 
 Both families accept either invocation style: the ptp-style key-presence form
-above, or comxim's ``{"command": "set_focus_position", "position": 1234}``. The
+above, or the named form ``{"command": "set_focus_position", "position": 1234}``. The
 webapp uses both across the machine, so supporting both here costs one
 normalisation step and saves every caller from remembering which module is
 which.
@@ -54,7 +53,7 @@ _NESTED = (
     "summary",
 )
 
-#: Commands whose result is returned flat, per scope.md §5.
+#: Commands whose result is returned flat
 _FLAT = (
     "get_focus_position",
     "set_focus_position",
@@ -104,7 +103,7 @@ class CommandHandler:
 
         `opts` are accepted and ignored except `timeout_s`: `ptp` takes
         ``{"af": true}`` here, but this rig's whole point is that focus is set
-        from stored calibration rather than found per shot (scope.md §2.3), so
+        from stored calibration rather than found per shot, so
         an AF request is deliberately not honoured. Use `autofocus_once` during
         calibration instead.
         """
@@ -227,7 +226,7 @@ class CommandHandler:
         }
 
     # ------------------------------------------------------------------
-    # New commands (scope.md §5)
+    # New commands
     # ------------------------------------------------------------------
 
     async def _cmd_get_focus_position(self, opts: Mapping[str, Any]) -> Dict[str, ValueTypes]:
@@ -313,8 +312,8 @@ class CommandHandler:
 def _normalize(command: Mapping[str, ValueTypes]) -> Dict[str, Mapping[str, Any]]:
     """Reduce either invocation style to `{command_name: options}`.
 
-    comxim style - `{"command": "set_focus_position", "position": 1234}` - puts
-    the arguments alongside the command name, so the whole mapping minus
+    The named style - `{"command": "set_focus_position", "position": 1234}` -
+    puts the arguments alongside the command name, so the whole mapping minus
     `command` becomes the options.
     """
     named = command.get("command")

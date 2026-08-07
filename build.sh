@@ -8,12 +8,11 @@
 #      and `"binding": "fake"` still works - so a build machine with no SDK
 #      produces a usable-for-bring-up artifact rather than failing.
 #
-#   2. The CrSDK shared libraries, if `CRSDK_ROOT` is set AND
-#      `CRSDK_BUNDLE_LIBS=1`. That is opt-in on purpose: whether Sony's licence
-#      permits redistributing the .so files inside a module tarball is scope.md
-#      §10 open question 1, and defaulting to "yes" would answer it by
-#      accident. With it off, the operator places the libraries on the machine
-#      and the README says where.
+#   2. The CrSDK shared libraries, only when `CRSDK_ROOT` is set AND
+#      `CRSDK_BUNDLE_LIBS=1`. Local-development convenience ONLY: Sony's
+#      licence does not permit redistributing the SDK, so a bundled artifact
+#      must never be published. Deployed machines install the libraries at
+#      /opt/sony-crsdk instead (README, "Machine setup").
 cd `dirname $0`
 set -e
 

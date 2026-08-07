@@ -327,7 +327,7 @@ class TestNewCommands:
 
 
 class TestDispatch:
-    async def test_comxim_style_command_key(self, camera):
+    async def test_named_command_style(self, camera):
         # The webapp uses `{"command": "..."}` against other modules on the same
         # machine; supporting both styles saves every caller from remembering
         # which is which.
@@ -349,8 +349,8 @@ class TestDispatch:
             await camera.do_command({"command": "take_picture"})
 
     async def test_errors_carry_their_category(self, camera):
-        # scope.md §6: timeout / disconnected / unsupported-value / busy have to
-        # be distinguishable by a caller that only sees the message string.
+        # timeout / disconnected / unsupported-value / busy have to be
+        # distinguishable by a caller that only sees the message string.
         camera.fake.unplug()
         assert wait_until(lambda: not camera._session.connected)
         with pytest.raises(binding.CameraError) as exc:

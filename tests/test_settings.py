@@ -4,8 +4,8 @@ Settings encoding tests.
 These are the documentation of record for Sony's encodings: aperture as
 hundredths, shutter speed as a packed rational, ISO's auto sentinel. Every
 number in here was derived from the SDK's property reference, and if a value
-turns out to be wrong on hardware the fix belongs here first - the smoke
-checklist (SMOKE.md) verifies each one against what the body actually reports.
+turns out to be wrong on hardware the fix belongs here first - the hardware
+smoke checklist verifies each one against what the body actually reports.
 """
 
 import pytest
@@ -171,7 +171,7 @@ class TestValidateAll:
         }
 
     def test_unknown_keys_are_rejected_loudly(self):
-        # scope.md §4: "reject unknown apply_on_connect keys loudly". A silently
+        # Unknown apply_on_connect keys are rejected loudly. A silently
         # dropped "apeture" is a config that looks applied and isn't.
         with pytest.raises(UnsupportedValueError) as exc:
             settings_mod.validate_all({"apeture": "f/11"})

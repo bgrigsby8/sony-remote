@@ -13,7 +13,7 @@ from session import CameraSession, SessionConfig  # noqa: E402
 
 class RecordingLogger:
     """Collects log lines so tests can assert on the audit trail, which is a
-    deliverable here (scope.md §6) rather than incidental output."""
+    deliverable here rather than incidental output."""
 
     def __init__(self):
         self.lines = []

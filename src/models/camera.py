@@ -214,7 +214,7 @@ class Camera(CameraBase, EasyResource):
 
         Strictly paired with the `init()` in the session's owner thread; getting
         this wrong is what forces an operator to power-cycle the body after a
-        viam-server restart (scope.md §6).
+        viam-server restart.
         """
         session = getattr(self, "_session", None)
         if session is not None:

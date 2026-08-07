@@ -184,7 +184,7 @@ class CaptureStore:
     # ------------------------------------------------------------------
     # Shutter counter
     #
-    # Mechanical-shutter wear tracking (scope.md §5). The body has its own
+    # Mechanical-shutter wear tracking. The body has its own
     # internal count that CrSDK doesn't expose, so this counts what *we* fired.
     # It has to survive restarts to mean anything, hence the state file.
     # ------------------------------------------------------------------

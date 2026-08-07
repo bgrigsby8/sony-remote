@@ -303,7 +303,7 @@ SETTING_KEYS: List[str] = list(SETTINGS)
 #: Applied at connect when `apply_on_connect` doesn't say otherwise. Mechanical
 #: shutter is the default because the rig fires a strobe: the electronic shutter
 #: on this body reads the sensor progressively, so a flash lights only the band
-#: of rows exposed while it fired (scope.md §4).
+#: of rows exposed while it fired.
 DEFAULT_SHUTTER_TYPE = "mechanical"
 
 
@@ -325,7 +325,7 @@ def validate(key: str, value: Any) -> Any:
 def validate_all(values: Dict[str, Any]) -> Dict[str, Any]:
     """Encode a whole `apply_on_connect` / `set_settings` block.
 
-    Unknown keys are rejected loudly (scope.md §4) rather than ignored: a
+    Unknown keys are rejected loudly rather than ignored: a
     silently-dropped `"apeture"` is a config that looks applied and isn't.
     """
     unknown = [k for k in values if k not in SETTINGS]

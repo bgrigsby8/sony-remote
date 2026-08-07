@@ -8,7 +8,7 @@ extension's flat error strings into the typed exceptions everything upstream
 branches on. Both are pure Python.
 
 The rest of the native path is deliberately thin enough to be covered by the
-hardware smoke checklist (SMOKE.md), per scope.md §7.
+hardware smoke checklist.
 """
 
 import inspect

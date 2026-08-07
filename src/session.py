@@ -88,7 +88,7 @@ _JOB_QUEUE_GRACE_S = 30.0
 
 # The lens needs a moment to physically move before a read-back means anything.
 # TUNE ON HARDWARE - too short and every `set_focus_position` "misses" and
-# retries; too long and each station in a sweep pays for it. See SMOKE.md.
+# retries; too long and each station in a sweep pays for it.
 _FOCUS_SETTLE_S = 0.15
 
 # Default tolerance for `set_focus_position`, in raw SDK units. Focus is a
@@ -248,7 +248,7 @@ class CameraSession:
         A cache hit doesn't queue a job at all, so a webapp preview polling at
         30fps costs nothing while a capture is running. A cache hit is only
         possible while connected - a disconnected camera raises rather than
-        handing back a stale frame (scope.md §5).
+        handing back a stale frame.
         """
         if not self._connected:
             raise NotConnectedError(
@@ -670,8 +670,8 @@ class CameraSession:
         # for the *previous* capture can still be sitting there - if the last
         # shot was resolved by the directory diff, or timed out, its event
         # arrives late - and picking it up here would make this capture return
-        # the previous shot's path. Same hazard, same fix, as clearing the event
-        # queue before a move in `comxim`.
+        # the previous shot's path. Clearing the queue first makes "files from
+        # now on" mean exactly that.
         self._pump_events(0.0)
 
         before = self._store.snapshot()
@@ -709,7 +709,7 @@ class CameraSession:
         primary = primary_file(paths)
         duration = time.monotonic() - started
 
-        # The audit trail (scope.md §6): everything needed to answer "why does
+        # The audit trail: everything needed to answer "why does
         # this image look like that" from the log alone.
         self._log(
             "info",
@@ -830,7 +830,7 @@ class CameraSession:
 
         achieved = None
         attempts = 0
-        # One retry, per scope.md §5. A second miss is a real condition (the
+        # One retry A second miss is a real condition (the
         # lens is at a mechanical stop, or the body took focus back) and is
         # reported as ok=false rather than retried forever - the caller decides
         # whether a slightly-off focus is acceptable for that station.

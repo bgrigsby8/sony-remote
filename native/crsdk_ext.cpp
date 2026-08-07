@@ -28,10 +28,10 @@
 // the C++ side to one helper and needs no registered exception type.
 //
 // ---------------------------------------------------------------------------
-// STATUS: compiles and links against CrSDK v2.02.00 (Linux x64). Not yet
-// validated against a live body - SMOKE.md is the checklist for that. If a
-// future SDK bump renames symbols, the fixes belong in the tables below and
-// nothing above binding/interface.py changes.
+// STATUS: compiles and links against CrSDK v2.02.00 (Linux x64), validated
+// against an ILCE-7RM5 over USB. If a future SDK bump renames symbols, the
+// fixes belong in the tables below and nothing above binding/interface.py
+// changes.
 // ---------------------------------------------------------------------------
 
 #include <pybind11/pybind11.h>
@@ -72,11 +72,12 @@ static const std::map<std::string, cr::CrDevicePropertyCode> kPropertyCodes = {
     {"still_file_format", cr::CrDeviceProperty_FileType},
     {"exposure_program_mode", cr::CrDeviceProperty_ExposureProgramMode},
     {"focus_mode", cr::CrDeviceProperty_FocusMode},
-    // Absolute focus. scope.md §10 Q3: confirm this exists on ILCE-7RM5 in the
-    // SDK's per-model feature matrix. If it does not, the fallback is relative
-    // stepping via CrDeviceProperty_NearFar - and the change is confined to
-    // this file plus a `focus_position` shim, because Python only ever asks for
-    // "focus_position".
+    // Absolute focus. The body must support it (ILCE-7RM5 does) AND the lens
+    // must provide position telemetry - with an unsupported lens the property
+    // simply never appears in GetDeviceProperties (verified: Sony's RemoteCli
+    // says "not supported" for the same body+lens). Fallback for unsupported
+    // lenses is relative stepping via CrDeviceProperty_NearFar; that change
+    // would be confined to this file plus a `focus_position` shim.
     {"focus_position", cr::CrDeviceProperty_FocusPositionSetting},
     {"shutter_type", cr::CrDeviceProperty_ShutterType},
     {"battery_level", cr::CrDeviceProperty_BatteryRemain},
@@ -176,7 +177,7 @@ static void push_event(const Ev& ev) {
 }
 
 // ---------------------------------------------------------------------------
-// Global session state. "One process, one camera" (scope.md §3) is enforced in
+// Global session state. "One process, one camera" is enforced in
 // Python; this side simply holds the single handle.
 // ---------------------------------------------------------------------------
 
@@ -319,7 +320,7 @@ class Callback : public cr::IDeviceCallback {
 
    private:
     // CrChar is wchar_t on Windows and char elsewhere. This module is
-    // POSIX-only (scope.md §2 non-goals), so the narrow path is the only one -
+    // POSIX-only, so the narrow path is the only one -
     // but the conversion is isolated here so a Windows port is one function.
     static std::string to_utf8(const CrChar* s) { return std::string(s); }
 };

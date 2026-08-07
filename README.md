@@ -94,6 +94,24 @@ For development only, `build.sh` can bundle the libraries into a local build
 with `CRSDK_BUNDLE_LIBS=1 CRSDK_ROOT=/path/to/sdk make build` - never publish
 such an artifact; that is redistribution.
 
+### Camera setup (one time, on the body)
+
+- **Setup → USB → USB Connection Mode → Remote Shoot (PC Remote).** If set to
+  "Select When Connect", someone has to touch the camera every time the cable
+  is plugged in - set it explicitly.
+- In the Remote Shoot settings: **Still Img. Save Dest. → PC only** (the
+  module also enforces this per session, but matching the menu avoids
+  surprises when the camera is used standalone) and **Save Image Size →
+  Original** (the 2M default silently downsizes transferred JPEGs).
+- **Focus**: leave the lens barrel's AF/MF switch on **AF** and set MF from
+  the body's focus-mode menu when manual focus is wanted - with the barrel
+  switch on MF, some lenses drop off the electronic focus bus entirely.
+- **Power save**: disable auto power-off (Setup → Power Setting Option) for
+  rig use - a sleeping body drops the USB session. The module reconnects
+  automatically, but a capture issued mid-drop fails.
+- The module takes **PC-remote priority** at connect, so the body's physical
+  dials will not respond while a session is active. This is deliberate.
+
 ### Host prerequisites
 
 Linux caps userspace USB transfer buffers at **16MB** by default
@@ -238,36 +256,23 @@ complete, and focus that doesn't land exactly where you put it.
 The native binding needs hardware. What can be tested without it is: that it
 implements the whole interface with matching signatures, and that it translates
 the extension's error strings into the right typed exceptions. The rest is
-deliberately thin enough to be covered by [`SMOKE.md`](SMOKE.md), which is the
-checklist to run the day the camera arrives.
+deliberately thin enough to be covered by the hardware smoke checklist, which
+has been run against a real body.
 
 ## Status
 
-`crsdk_ext.cpp` compiles and links against **CrSDK v2.02.00 (Linux x64)**. The
-notable corrections from the first real compile: the still-file-format property
-is `CrDeviceProperty_FileType`, and S1 half-press is a device property
-(`CrDeviceProperty_S1` = `CrLockIndicator_Locked`), not a `SendCommand`.
-Validation against a live body is next — [`SMOKE.md`](SMOKE.md) is the
-checklist. Nothing above `binding/interface.py` changed, and the test suite is
-unaffected.
+Built against **CrSDK v2.02.00** and validated on hardware (ILCE-7RM5 over
+USB): connect/reconnect, settings control, live view, and direct-to-host RAW
+capture all verified end to end.
 
-## Open questions
+Known limitations:
 
-Tracked from `scope.md` §10; none of them block bring-up.
-
-1. **CrSDK redistribution - ANSWERED (2026-08-07): we don't.** Sony's licence
-   is treated as prohibiting redistribution, so published artifacts never
-   contain Sony's `.so` files. Each machine installs them at `/opt/sony-crsdk`
-   (see "Machine setup"); `CRSDK_BUNDLE_LIBS=1` remains as a local-development
-   convenience only.
-2. **CI SDK storage.** Private GitHub release asset vs. publishing only from a
-   build machine that already has the SDK. Until then CI runs the test suite
-   (which needs neither) and `make publish` is local.
-3. **Focus Position Setting on ILCE-7RM5.** Confirm in the SDK's per-model
-   feature matrix before M2. If absent, the fallback is relative stepping via the
-   near/far drive, re-homed each sweep — that change is confined to
-   `crsdk_ext.cpp`, because Python only ever asks for `"focus_position"`.
-4. **Live view during capture.** Answered structurally: one owner thread means
-   live-view polling and capture cannot interleave, whatever the SDK turns out to
-   require. Still worth confirming on hardware that frames resume promptly after
-   a shot — it's on the smoke checklist.
+- **Absolute focus position requires a compatible lens.** The body supports
+  `CrDeviceProperty_FocusPositionSetting`, but the lens must provide position
+  telemetry or the property never appears (the FE 35mm F1.8 does not; Sony's
+  own RemoteCli reports "not supported" on the same combination). With an
+  unsupported lens, `get/set_focus_position` return an `[unsupported_value]`
+  error; a relative-stepping fallback via the near/far drive is a possible
+  future addition, confined to `crsdk_ext.cpp`.
+- **`linux/amd64` artifacts only** until an ARM build host or CI pipeline is
+  set up. The test suite and `"binding": "fake"` work anywhere Python does.

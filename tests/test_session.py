@@ -70,7 +70,7 @@ class TestConnect:
         started = time.monotonic()
         with pytest.raises(NotConnectedError) as exc:
             session.capture()
-        # "Fails fast" is the requirement (scope.md §6) - a caller must not sit
+        # "Fails fast" is the requirement - a caller must not sit
         # on a 15-second capture timeout for a camera that isn't there.
         assert time.monotonic() - started < 1.0
         assert str(exc.value).startswith("[disconnected]")
@@ -250,7 +250,7 @@ class TestCapture:
         assert result["focus_position"] == 128
         assert result["settings"]["aperture"] == "f/11"
 
-        # scope.md §6: this line is the answer when Nines questions an image.
+        # This log line is the audit trail when an operator questions an image.
         line = logger.text("info")
         assert result["path"] in line
         assert "focus=128" in line
@@ -341,9 +341,8 @@ class TestCapture:
         assert len(session.store.list_images()) == 2
 
     def test_captures_serialize(self, session, fake):
-        # scope.md §6: concurrent DoCommands queue. One owner thread makes that
-        # structural, and that in turn is why live view can't interleave with a
-        # capture (open question §10.4).
+        # Concurrent DoCommands queue. One owner thread makes that structural,
+        # and that in turn is why live view can't interleave with a capture.
         results = []
         errors = []
 
@@ -530,7 +529,7 @@ class TestLifecycle:
         assert wait_until(lambda: session.connected)
         session.close()
         # Unpaired init/release is what forces an operator to power-cycle the
-        # body after a viam-server restart (scope.md §6).
+        # body after a viam-server restart.
         assert fake.released is True
         assert fake.is_connected() is False
 

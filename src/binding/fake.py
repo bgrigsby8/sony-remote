@@ -2,8 +2,7 @@
 binding/fake.py
 ---------------
 A simulated A7R V, good enough that every layer above `CameraBinding` can be
-tested with no hardware, no SDK and no USB - the same trick `comxim` plays with
-`FakeSerial`.
+tested with no hardware, no SDK and no USB.
 
 It models the four behaviours that make the real camera awkward to program
 against, because those are the ones the module exists to handle:
