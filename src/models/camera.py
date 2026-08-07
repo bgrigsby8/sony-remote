@@ -54,6 +54,7 @@ from viam.resource.easy_resource import EasyResource
 from viam.resource.types import Model, ModelFamily
 from viam.utils import ValueTypes, struct_to_dict
 
+import crsdk_install
 import settings as settings_mod
 from binding import CameraError, make_binding
 from models.commands import CommandHandler
@@ -144,6 +145,15 @@ class Camera(CameraBase, EasyResource):
         if binding is not None and binding not in ("native", "fake"):
             raise ValueError('`binding` must be "native" or "fake"')
 
+        crsdk_archive = attrs.get("crsdk_archive")
+        if crsdk_archive is not None and (
+            not isinstance(crsdk_archive, str) or not crsdk_archive.strip()
+        ):
+            raise ValueError(
+                "`crsdk_archive` must be the path to the Camera Remote SDK "
+                "zip downloaded from Sony (or an extracted copy)"
+            )
+
         apply_on_connect = attrs.get("apply_on_connect")
         if apply_on_connect is not None:
             if not isinstance(apply_on_connect, dict):
@@ -187,6 +197,22 @@ class Camera(CameraBase, EasyResource):
             focus_tolerance=int(attr("focus_tolerance")),
             apply_on_connect=dict(attrs.get("apply_on_connect") or {}),
         )
+
+        # Operator-provided SDK archive: install Sony's runtime libraries into
+        # /opt/sony-crsdk before the session first tries to import _crsdk.
+        # Failure is logged, not fatal - the session still starts, and
+        # get_status carries the actionable import error.
+        crsdk_archive = attrs.get("crsdk_archive")
+        if self._binding_kind == "native" and crsdk_archive:
+            try:
+                crsdk_install.ensure_installed(
+                    os.path.expanduser(str(crsdk_archive)), log=self.logger.info
+                )
+            except Exception as exc:  # noqa: BLE001 - surfaced, not fatal
+                self.logger.error(
+                    f"could not install the CrSDK libraries from "
+                    f"{crsdk_archive}: {exc}"
+                )
 
         old = getattr(self, "_session", None)
         if old is not None:

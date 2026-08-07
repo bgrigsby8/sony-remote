@@ -60,25 +60,35 @@ make ext                                               # builds src/_crsdk*.so
 ### Machine setup (per deployed machine, one time)
 
 Sony's licence does not permit redistributing the SDK's shared libraries, so
-they are **not** inside the module tarball. Each machine provides them at the
-conventional path `/opt/sony-crsdk` (the extension's rpath looks there):
+they are **not** inside the module tarball. Instead:
+
+1. Download the Camera Remote SDK zip from Sony (registration + licence
+   acceptance) and copy it anywhere on the machine, e.g.
+   `/home/viam/CrSDK_v2.02.00_Linux64PC.zip`.
+2. Point the component's `crsdk_archive` attribute at it:
+
+   ```json
+   { "crsdk_archive": "/home/viam/CrSDK_v2.02.00_Linux64PC.zip" }
+   ```
+
+At configure time the module unpacks the runtime libraries into
+`/opt/sony-crsdk` (where the extension's rpath looks) and never touches the
+zip again - the attribute can stay in the config forever. The usbfs memory cap
+(see Host prerequisites) is handled by the module's `first_run` script, so
+steps 1-2 really are the whole host-side install.
+
+Prefer doing it by hand (or viam-server isn't running as root, so the module
+can't write `/opt`)? The equivalent manual step:
 
 ```bash
-# 1. Download the Camera Remote SDK from Sony (registration + licence
-#    acceptance), copy the zip to the machine, then:
-cd ~ && unzip CrSDK_v*_Linux64PC.zip -d sony && cd sony && unzip RemoteCli.zip -d RemoteCli
-
-# 2. Install the runtime libraries where the module expects them:
-sudo mkdir -p /opt/sony-crsdk
-sudo cp -r RemoteCli/external/crsdk/. /opt/sony-crsdk/
+unzip CrSDK_v*_Linux64PC.zip 'RemoteCli.zip' && unzip RemoteCli.zip 'external/crsdk/*'
+sudo mkdir -p /opt/sony-crsdk && sudo cp -r external/crsdk/. /opt/sony-crsdk/
 ```
 
-That's the whole host-side install: `/opt/sony-crsdk` ends up holding
-`libCr_Core.so`, `libmonitor_protocol*.so` and the `CrAdapter/` directory
-(whose location next to `libCr_Core` is load-bearing - `libCr_Core` dlopens
-its adapters relative to itself, not via `LD_LIBRARY_PATH`). The usbfs memory
-cap (see Host prerequisites) is handled automatically by the module's
-`first_run` script.
+Either way `/opt/sony-crsdk` ends up holding `libCr_Core.so`,
+`libmonitor_protocol*.so` and the `CrAdapter/` directory (whose location next
+to `libCr_Core` is load-bearing - `libCr_Core` dlopens its adapters relative
+to itself, not via `LD_LIBRARY_PATH`).
 
 If the module starts but every command reports
 
@@ -141,6 +151,7 @@ non-goal.
 ```json
 {
   "serial": "",
+  "crsdk_archive": "/home/viam/CrSDK_v2.02.00_Linux64PC.zip",
   "capture_dir": "/tmp/sony-remote",
   "retention_max_files": 200,
   "live_view_max_fps": 10,

@@ -12,6 +12,7 @@ work, but only the A7R V is verified.
 ```json
 {
   "serial": "",
+  "crsdk_archive": "/home/viam/CrSDK_v2.02.00_Linux64PC.zip",
   "capture_dir": "/tmp/sony-remote",
   "retention_max_files": 200,
   "live_view_max_fps": 10,
@@ -38,6 +39,7 @@ Every attribute is optional.
 | Name | Type | Default | Description |
 |---|---|---|---|
 | `serial` | string | — | Which body to claim. Required if more than one Sony camera is on USB; with two cameras and no `serial`, the component refuses to connect and says so in `get_status.last_error` rather than picking one at random. Matched exactly or as a suffix. |
+| `crsdk_archive` | string | — | Path to the Camera Remote SDK zip downloaded from Sony (or an extracted copy). On configure, the module installs the SDK's runtime libraries from it into `/opt/sony-crsdk` if they aren't there yet, then never touches it again — the attribute can stay in the config. Sony's licence keeps these libraries out of the module itself; this automates the one manual install step (see the README's "Machine setup"). |
 | `capture_dir` | string | `/tmp/sony-remote` | Where the SDK writes stills. Created if missing. The module owns retention here. `~` is expanded. |
 | `retention_max_files` | number | `200` | Delete the oldest images beyond this after each capture. `0` disables retention. Non-image files (including the module's state file) are never touched. |
 | `live_view_max_fps` | number | `10` | Ceiling on how often live view is actually fetched from the camera. `get_images` calls inside the interval return the cached frame without a USB round trip. |

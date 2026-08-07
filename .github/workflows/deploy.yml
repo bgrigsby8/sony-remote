@@ -1,4 +1,20 @@
-# see https://github.com/viamrobotics/build-action for help
+# Publish a tagged release to the Viam registry.
+#
+# This builds on the GitHub runner rather than via Viam cloud build
+# (viamrobotics/build-action): compiling the _crsdk extension requires the
+# Sony Camera Remote SDK, which cannot live in this repository or on Viam's
+# build machines - Sony's licence prohibits redistribution. The runner fetches
+# it at build time from PRIVATE storage the org controls, and the published
+# artifact contains only this repo's code (machines install Sony's runtime
+# libraries themselves - README, "Machine setup").
+#
+# Required repository secrets:
+#   CRSDK_ARCHIVE_URL    URL of CrSDK_v*_Linux64PC.zip in private storage
+#                        (private release asset, presigned bucket URL, ...).
+#   CRSDK_ARCHIVE_TOKEN  Bearer token for that URL, if it needs one.
+#   viam_key_id          Viam org API key id (already configured).
+#   viam_key_value       Viam org API key value (already configured).
+
 on:
   push:
     tags:
@@ -6,18 +22,55 @@ on:
       - "v?[0-9]+.[0-9]+.[0-9]+"
       - "v?[0-9]+.[0-9]+.[0-9]+-rc[0-9]+"
 
-
 jobs:
-  publish:
+  test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: viamrobotics/build-action@v1
+      - uses: actions/setup-python@v5
         with:
-          # note: you can replace this line with 'version: ""' if
-          # you want to test the build process without deploying
-          version: ${{ github.ref_name }}
-          ref: ${{ github.sha }}
+          python-version: "3.12"
+      - name: Run the hardware-free suite
+        run: |
+          make setup
+          make test
+
+  publish:
+    needs: test
+    runs-on: ubuntu-latest # linux/amd64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Fetch the Camera Remote SDK from private storage
+        run: |
+          curl -fsSL ${CRSDK_ARCHIVE_TOKEN:+-H "Authorization: Bearer $CRSDK_ARCHIVE_TOKEN"} \
+            -o crsdk.zip "$CRSDK_ARCHIVE_URL"
+          unzip -q crsdk.zip -d crsdk
+          unzip -q crsdk/RemoteCli.zip -d crsdk/RemoteCli
+          echo "CRSDK_ROOT=$PWD/crsdk/RemoteCli" >> "$GITHUB_ENV"
+        env:
+          CRSDK_ARCHIVE_URL: ${{ secrets.CRSDK_ARCHIVE_URL }}
+          CRSDK_ARCHIVE_TOKEN: ${{ secrets.CRSDK_ARCHIVE_TOKEN }}
+
+      - name: Build the module
+        # No CRSDK_BUNDLE_LIBS: published artifacts never contain Sony's
+        # libraries.
+        run: |
+          make setup
+          make ext
+          make build
+
+      - name: Compute registry version from the tag
+        run: echo "MODULE_VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+
+      - name: Upload to the Viam registry
+        uses: viamrobotics/upload-module@v1
+        with:
+          module-path: dist/archive.tar.gz
+          platform: linux/amd64
+          version: ${{ env.MODULE_VERSION }}
           key-id: ${{ secrets.viam_key_id }}
           key-value: ${{ secrets.viam_key_value }}
-          token: ${{ github.token }} # only required for private git repos
