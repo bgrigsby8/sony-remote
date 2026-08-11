@@ -169,3 +169,5 @@ reload-*/
 
 scope.md
 SMOKE.md
+# The module build spec is source, not generated output.
+!main.spec
