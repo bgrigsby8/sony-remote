@@ -130,6 +130,11 @@ class FakeCamera(CameraBinding):
         self.near_far_units_per_step = 2
         self.focus_min = 0
         self.focus_max = 500
+        # False models the ILCE-7RM5 over USB: the near/far drive works but
+        # the absolute focus_position property is never reported, so the
+        # session's emulation layer takes over. The internal focus_position
+        # value keeps tracking the physical truth for assertions.
+        self.absolute_focus_supported = True
         # Extra cameras `enumerate` should report, to test the ambiguity guard.
         self.extra_devices: List[DeviceInfo] = []
 
@@ -258,6 +263,8 @@ class FakeCamera(CameraBinding):
 
     def get_property(self, name: str) -> PropertyValue:
         self._require_connected()
+        if name == "focus_position" and not self.absolute_focus_supported:
+            raise UnsupportedValueError("this body does not report property 'focus_position'")
         prop = self._properties.get(name)
         if prop is None:
             raise UnsupportedValueError(f"this body has no property {name!r}")
@@ -273,6 +280,8 @@ class FakeCamera(CameraBinding):
             self.busy_once = False
             raise BusyError(f"camera busy, cannot set {name}")
 
+        if name == "focus_position" and not self.absolute_focus_supported:
+            raise UnsupportedValueError("this body does not report property 'focus_position'")
         prop = self._properties.get(name)
         if prop is None:
             raise UnsupportedValueError(f"this body has no property {name!r}")

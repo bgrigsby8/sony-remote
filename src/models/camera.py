@@ -72,6 +72,10 @@ _DEFAULTS: Dict[str, Any] = {
     "autofocus_timeout_s": 5.0,
     "focus_tolerance": 2,
     "binding": "native",
+    "focus_emulation": "auto",
+    "emulated_step_size": 3,
+    "emulated_travel_nudges": 150,
+    "emulated_nudge_interval_s": 0.03,
 }
 
 _POSITIVE_NUMBERS = (
@@ -155,6 +159,21 @@ class Camera(CameraBase, EasyResource):
                 "zip downloaded from Sony (or an extracted copy)"
             )
 
+        focus_emulation = attrs.get("focus_emulation")
+        if focus_emulation is not None and focus_emulation not in ("auto", "off"):
+            raise ValueError('`focus_emulation` must be "auto" or "off"')
+        step_size = attrs.get("emulated_step_size")
+        if step_size is not None and (
+            not _is_number(step_size) or not 1 <= step_size <= 7
+        ):
+            raise ValueError("`emulated_step_size` must be 1..7")
+        travel = attrs.get("emulated_travel_nudges")
+        if travel is not None and (not _is_number(travel) or travel < 1):
+            raise ValueError("`emulated_travel_nudges` must be a positive number")
+        interval = attrs.get("emulated_nudge_interval_s")
+        if interval is not None and (not _is_number(interval) or interval < 0):
+            raise ValueError("`emulated_nudge_interval_s` must be >= 0")
+
         apply_on_connect = attrs.get("apply_on_connect")
         if apply_on_connect is not None:
             if not isinstance(apply_on_connect, dict):
@@ -197,6 +216,10 @@ class Camera(CameraBase, EasyResource):
             autofocus_timeout_s=float(attr("autofocus_timeout_s")),
             focus_tolerance=int(attr("focus_tolerance")),
             apply_on_connect=dict(attrs.get("apply_on_connect") or {}),
+            focus_emulation=str(attr("focus_emulation")),
+            emulated_step_size=int(attr("emulated_step_size")),
+            emulated_travel_nudges=int(attr("emulated_travel_nudges")),
+            emulated_nudge_interval_s=float(attr("emulated_nudge_interval_s")),
         )
 
         # Host checks only a real camera cares about; a fake-binding component

@@ -49,6 +49,10 @@ Every attribute is optional.
 | `focus_tolerance` | number | `2` | How far, in raw SDK units, a focus read-back may differ from the target and still count as landed. Overridable per call. |
 | `binding` | string | `"native"` | `"native"` drives a real camera through the `_crsdk` extension. `"fake"` drives a simulated A7R V that writes synthetic files — for bring-up before hardware arrives. A `"fake"` component logs a warning on every configure. |
 | `apply_on_connect` | object | `{"shutter_type": "mechanical"}` | Settings pushed to the body on every connect, including after a reconnect. Keys are the same as `set_settings` (below). Unknown keys are rejected at config-validation time. |
+| `focus_emulation` | string | `"auto"` | `"auto"`: when the body never reports an absolute focus position (the ILCE-7RM5 over USB doesn't, with any lens — verified against Sony's own RemoteCli), rebuild it over the relative near/far drive: home into the near stop, count nudges. `"off"` disables the emulation and focus-position commands fail with `[unsupported_value]`. |
+| `emulated_step_size` | number | `3` | Near/far magnitude (1–7) used for every emulated nudge. One position unit = one nudge of this size, so changing it invalidates stored focus tables. |
+| `emulated_travel_nudges` | number | `150` | Homing budget and position ceiling: this many nudges must cross the lens's full travel with margin. Calibrate per lens with `focus_near_far`. |
+| `emulated_nudge_interval_s` | number | `0.03` | Pause after each nudge, letting the drive settle. |
 
 `apply_on_connect` values are validated all the way down to their raw SDK
 encoding when the machine config is saved, so a mistyped aperture is a config
@@ -145,6 +149,15 @@ does not document a physical unit, and inventing one would be a precision we
 don't have. Calibration stores whatever integer the camera reported at a station
 and plays it back.
 
+On bodies that never report an absolute position (the ILCE-7RM5 over USB),
+`units` is `"emulated_nudges"` instead: the position is a count of near/far
+nudges from the lens's near stop, maintained by the module (see the
+`focus_emulation` attributes). The first focus operation after a connect,
+autofocus, or manual nudge **homes automatically** — it drives the lens hard
+into the near stop and calls that zero, which takes
+`emulated_travel_nudges × emulated_nudge_interval_s` seconds. Calibration works
+exactly as before: store the integer, play it back.
+
 ### `set_focus_position`
 
 ```json
@@ -164,11 +177,38 @@ A second miss returns `"ok": false` with the position it did reach, rather than
 retrying forever — whether that's good enough for a given station is the
 caller's call.
 
+### `focus_near_far`
+
+```json
+{"focus_near_far": {"step": -3}}  ->  {"step": -3}
+```
+
+One raw relative focus nudge: sign is direction (negative = near), magnitude
+1–7 is the step size. The bring-up and calibration primitive under emulated
+focus — count how many `step: 7` nudges cross your lens's travel to size
+`emulated_travel_nudges`. A manual nudge invalidates the emulated position
+count until the next focus operation re-homes.
+
+### `home_focus`
+
+```json
+{"home_focus": {}}  ->  {"emulated": true, "position": 0, "units": "emulated_nudges"}
+```
+
+Re-zero emulated focus against the near stop. Sweep orchestration should call
+this at sweep start so per-station positions stay honest; it is otherwise
+called automatically by the first focus operation that needs it. On bodies
+with native absolute focus it reports `{"emulated": false}` and does nothing.
+
 ### `autofocus_once`
 
 ```json
 {"autofocus_once": {}}  ->  {"position": 1204, "units": "sdk_raw", "acquired": true}
 ```
+
+Under emulated focus, `position` comes back `null` and the stored count is
+invalidated (AF moved the lens an unknown amount); the next focus operation
+re-homes.
 
 One-shot AF (half-press equivalent), then report where focus ended up. **For
 calibration only**: run it once per station with the product in place, store the

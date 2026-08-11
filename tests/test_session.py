@@ -184,9 +184,6 @@ class TestApplyOnConnect:
         assert fake.property_value("focus_position") == fake.focus_min
 
     def test_pc_remote_priority_is_taken_before_any_setting(self, make_session, fake):
-        # A real body boots owning its shooting settings and rejects (or
-        # silently ignores) remote sets until the PC takes priority - so the
-        # priority write must land first, or the whole recipe bounces.
         session = make_session(fake, apply_on_connect={"aperture": "f/11"})
         assert wait_until(lambda: session.connected)
         assert fake.property_value("priority_key") == "PCRemote"
@@ -195,6 +192,7 @@ class TestApplyOnConnect:
         assert names[0] == "priority_key"
         assert names[1] == "store_destination"
         assert "f_number" in names
+
 
     def test_a_busy_body_gets_one_settle_and_retry(self, make_session, fake, logger):
         # The A7R V rejects the first write fired too soon after the handshake
@@ -235,6 +233,90 @@ class TestApplyOnConnect:
         assert any("aperture" in e for e in status["apply_errors"])
         assert "apply_on_connect failed" in logger.text("error")
         assert session.live_view()
+
+
+class TestEmulatedFocus:
+    """The ILCE-7RM5 over USB never reports FocusPositionSetting, with any
+    lens or mode (verified against Sony's own RemoteCli). Absolute focus is
+    rebuilt over the blind near/far drive: home into the near stop, count
+    nudges. These tests run that whole mechanism against the fake's physical
+    model."""
+
+    def _emulating(self, make_session, fake):
+        fake.absolute_focus_supported = False
+        session = make_session(
+            fake,
+            emulated_nudge_interval_s=0,
+            emulated_travel_nudges=40,
+            emulated_step_size=3,
+        )
+        assert wait_until(lambda: session.connected)
+        return session
+
+    def test_first_focus_read_homes_against_the_near_stop(self, make_session, fake):
+        session = self._emulating(make_session, fake)
+        assert session.get_focus_position() == 0
+        assert fake.property_value("focus_position") == fake.focus_min
+
+    def test_positions_are_nudge_counts_and_reproducible(self, make_session, fake):
+        session = self._emulating(make_session, fake)
+        physical_per_nudge = 3 * fake.near_far_units_per_step
+
+        result = session.set_focus_position(10)
+        assert result["ok"] is True
+        assert result["position"] == 10
+        assert result["units"] == "emulated_nudges"
+        assert fake.property_value("focus_position") == fake.focus_min + 10 * physical_per_nudge
+
+        session.set_focus_position(4)
+        assert fake.property_value("focus_position") == fake.focus_min + 4 * physical_per_nudge
+        assert session.get_focus_position() == 4
+
+    def test_targets_beyond_travel_clamp(self, make_session, fake, logger):
+        session = self._emulating(make_session, fake)
+        result = session.set_focus_position(100)
+        assert result["position"] == 40
+        assert "clamped" in logger.text("warning")
+
+    def test_autofocus_invalidates_the_count(self, make_session, fake):
+        session = self._emulating(make_session, fake)
+        session.set_focus_position(10)
+        result = session.autofocus_once()
+        assert result["position"] is None
+        assert session.device_status()["focus_homed"] is False
+        # The next focus operation silently re-homes and the count is honest
+        # again.
+        assert session.get_focus_position() == 0
+        assert fake.property_value("focus_position") == fake.focus_min
+
+    def test_manual_nudges_invalidate_the_count(self, make_session, fake):
+        session = self._emulating(make_session, fake)
+        session.set_focus_position(10)
+        session.focus_near_far(-7)
+        assert session.device_status()["focus_homed"] is False
+
+    def test_home_focus_re_zeros(self, make_session, fake):
+        session = self._emulating(make_session, fake)
+        session.set_focus_position(10)
+        result = session.home_focus()
+        assert result == {"emulated": True, "position": 0, "units": "emulated_nudges"}
+        assert fake.property_value("focus_position") == fake.focus_min
+
+    def test_status_reports_the_emulation(self, make_session, fake):
+        session = self._emulating(make_session, fake)
+        session.get_focus_position()
+        status = session.device_status()
+        assert status["focus_emulated"] is True
+        assert status["focus_homed"] is True
+
+    def test_native_bodies_are_untouched(self, make_session, fake):
+        session = make_session(fake)  # absolute focus supported
+        assert wait_until(lambda: session.connected)
+        result = session.home_focus()
+        assert result["emulated"] is False
+        status = session.device_status()
+        assert status["focus_emulated"] is False
+        assert status["focus_homed"] is None
 
 
 # ----------------------------------------------------------------------

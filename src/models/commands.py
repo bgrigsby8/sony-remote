@@ -59,6 +59,7 @@ _FLAT = (
     "set_focus_position",
     "autofocus_once",
     "focus_near_far",
+    "home_focus",
     "get_settings",
     "set_settings",
     "get_status",
@@ -263,6 +264,14 @@ class CommandHandler:
         if step == 0 or not -7 <= step <= 7:
             raise ValueError(f"`step` must be -7..7 and non-zero, got {step}")
         return await _to_thread(self._session.focus_near_far, step)
+
+    async def _cmd_home_focus(self, opts: Mapping[str, Any]) -> Dict[str, ValueTypes]:
+        """Re-zero emulated focus against the lens's near stop.
+
+        Sweep orchestration calls this at sweep start so per-station positions
+        stay honest. Informational no-op on bodies with native absolute focus.
+        """
+        return await _to_thread(self._session.home_focus)
 
     async def _cmd_get_settings(self, opts: Mapping[str, Any]) -> Dict[str, ValueTypes]:
         return await _to_thread(self._session.get_settings)

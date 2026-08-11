@@ -116,6 +116,18 @@ class SessionConfig:
     autofocus_timeout_s: float = 5.0
     focus_tolerance: int = _DEFAULT_FOCUS_TOLERANCE
     apply_on_connect: Dict[str, Any] = field(default_factory=dict)
+    # Emulated absolute focus, for bodies that refuse FocusPositionSetting
+    # over USB (the ILCE-7RM5 does, with every lens and mode tried - verified
+    # against Sony's own RemoteCli). "auto": emulate over the near/far drive
+    # when the real property is absent. "off": never emulate.
+    # A position is then a count of nudges from the near stop; each nudge is
+    # one near/far write of magnitude `emulated_step_size` (1-7), and homing
+    # drives `emulated_travel_nudges` nudges toward the near stop - size it so
+    # that many nudges crosses the lens's whole travel with margin.
+    focus_emulation: str = "auto"
+    emulated_step_size: int = 3
+    emulated_travel_nudges: int = 150
+    emulated_nudge_interval_s: float = 0.03
 
 
 class _Job:
@@ -180,6 +192,14 @@ class CameraSession:
         # property-changed event (a dial turned on the body, our own write)
         # invalidate it, rather than paying six round trips per shot.
         self._state_cache: Optional[Dict[str, Any]] = None
+
+        # Emulated-focus state, owner thread only. `_focus_probe` is None
+        # until the first focus operation asks whether the body reports the
+        # real property; True means "emulating over the near/far drive", and
+        # the counter is only meaningful while `_focus_homed`.
+        self._focus_probe: Optional[bool] = None
+        self._focus_homed = False
+        self._focus_counter = 0
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -286,6 +306,11 @@ class CameraSession:
             "autofocus_once", self._do_autofocus, timeout=self._config.autofocus_timeout_s
         )
 
+    def home_focus(self) -> Dict[str, Any]:
+        """Re-zero emulated focus against the near stop. No-op information on
+        bodies with native absolute focus."""
+        return self._submit("home_focus", self._do_home_focus)
+
     def focus_near_far(self, step: int) -> Dict[str, Any]:
         """One relative focus nudge: sign is direction (negative = near),
         magnitude 1-7 is the step size. The raw primitive under emulated
@@ -297,6 +322,8 @@ class CameraSession:
         # The property is signed Int16; the binding layer speaks unsigned, so
         # encode two's complement here.
         self._binding.set_property("near_far", step & 0xFFFF)
+        # A manual nudge moves the lens outside the emulated count.
+        self._focus_homed = False
         return {"step": step}
 
     def device_status(self) -> Dict[str, Any]:
@@ -432,6 +459,10 @@ class CameraSession:
             self._binding.set_save_destination(self._config.capture_dir)
             self._connected = True
             self._state_cache = None
+            # A (re)connect invalidates everything emulated focus knew: the
+            # lens may have moved while we weren't watching.
+            self._focus_probe = None
+            self._focus_homed = False
             # The body boots owning its shooting settings; until the PC takes
             # priority, remote sets are rejected (Api_InvalidCalled) or
             # silently ignored. Non-fatal like every apply: a body that
@@ -810,12 +841,102 @@ class CameraSession:
         self._state_cache = None
         return self._read_state(refresh=True)["settings"]
 
+    # -- emulated absolute focus ---------------------------------------
+    #
+    # The near/far drive is relative and blind (no position or driving-status
+    # telemetry on this body), so absolute positioning is rebuilt as: drive
+    # hard into the near stop (clamping is safe - a lens at its stop ignores
+    # further near nudges), call that zero, and count nudges from there. A
+    # position is honest only while nothing else moves the lens: autofocus and
+    # reconnects invalidate it, and the next focus operation re-homes.
+
+    def _focus_is_emulated(self) -> bool:
+        if self._config.focus_emulation == "off":
+            return False
+        if self._focus_probe is None:
+            try:
+                self._binding.get_property("focus_position")
+                self._focus_probe = False
+            except UnsupportedValueError:
+                self._focus_probe = True
+                self._log(
+                    "info",
+                    "body does not report an absolute focus position; emulating "
+                    "it over the near/far drive. Positions are nudge counts "
+                    "from the near stop; autofocus and reconnects re-home.",
+                )
+            except CameraError:
+                return False  # transient - probe again next time
+        return bool(self._focus_probe)
+
+    def _nudge_focus(self, step: int) -> None:
+        # Signed Int16 on the wire; the binding layer speaks unsigned.
+        self._binding.set_property("near_far", step & 0xFFFF)
+        time.sleep(self._config.emulated_nudge_interval_s)
+
+    def _ensure_focus_homed(self) -> None:
+        if self._focus_homed:
+            return
+        budget = int(self._config.emulated_travel_nudges)
+        step = int(self._config.emulated_step_size)
+        self._log(
+            "info",
+            f"homing focus: {budget} nudges of size {step} toward the near stop",
+        )
+        self._ensure_manual_focus()
+        for _ in range(budget):
+            self._nudge_focus(-step)
+        self._focus_counter = 0
+        self._focus_homed = True
+        self._state_cache = None
+
+    def _do_home_focus(self) -> Dict[str, Any]:
+        if not self._focus_is_emulated():
+            return {
+                "emulated": False,
+                "note": "this body reports absolute focus natively; homing is "
+                "not used",
+            }
+        self._focus_homed = False
+        self._ensure_focus_homed()
+        return {"emulated": True, "position": 0, "units": "emulated_nudges"}
+
+    def _do_set_focus_emulated(self, target: int) -> Dict[str, Any]:
+        self._ensure_focus_homed()
+        limit = int(self._config.emulated_travel_nudges)
+        clamped = max(0, min(int(target), limit))
+        if clamped != target:
+            self._log(
+                "warning",
+                f"emulated focus target {target} clamped to {clamped} "
+                f"(valid range 0..{limit})",
+            )
+        step = int(self._config.emulated_step_size)
+        sign = 1 if clamped > self._focus_counter else -1
+        for _ in range(abs(clamped - self._focus_counter)):
+            self._nudge_focus(sign * step)
+            self._focus_counter += sign
+        self._state_cache = None
+        return {
+            "position": self._focus_counter,
+            "target": clamped,
+            "tolerance": 0,
+            "attempts": 1,
+            "ok": True,
+            "units": "emulated_nudges",
+        }
+
     def _do_get_focus(self) -> int:
+        if self._focus_is_emulated():
+            self._ensure_focus_homed()
+            return self._focus_counter
         value = self._binding.get_property("focus_position").value
         return int(value)
 
     def _do_set_focus(self, position: int, tolerance: int) -> Dict[str, Any]:
         self._ensure_manual_focus()
+        if self._focus_is_emulated():
+            return self._do_set_focus_emulated(position)
 
         achieved = None
         attempts = 0
@@ -878,6 +999,15 @@ class CameraSession:
     def _do_autofocus(self) -> Dict[str, Any]:
         acquired = self._binding.autofocus_once(self._config.autofocus_timeout_s)
         self._state_cache = None
+        if self._focus_is_emulated():
+            # AF moved the lens an unknown amount; the counter is now a lie.
+            self._focus_homed = False
+            self._log(
+                "info",
+                "autofocus moved the lens; emulated focus positions are invalid "
+                "until the next focus operation re-homes",
+            )
+            return {"position": None, "units": "emulated_nudges", "acquired": acquired}
         position = int(self._binding.get_property("focus_position").value)
         if not acquired:
             self._log("warning", f"one-shot AF did not lock; focus is at {position}")
@@ -902,6 +1032,8 @@ class CameraSession:
             "connect_attempts": self._connect_attempts,
             "last_error": self._last_error,
             "apply_errors": list(self._apply_errors),
+            "focus_emulated": bool(self._focus_probe),
+            "focus_homed": bool(self._focus_homed) if self._focus_probe else None,
         }
 
     # ------------------------------------------------------------------
@@ -967,10 +1099,13 @@ class CameraSession:
                 # entry is unsupported.
                 continue
 
-        try:
-            focus = int(self._binding.get_property("focus_position").value)
-        except (CameraError, TypeError, ValueError):
-            focus = None
+        if self._focus_is_emulated():
+            focus = self._focus_counter if self._focus_homed else None
+        else:
+            try:
+                focus = int(self._binding.get_property("focus_position").value)
+            except (CameraError, TypeError, ValueError):
+                focus = None
 
         self._state_cache = {"settings": values, "focus_position": focus}
         return self._state_cache

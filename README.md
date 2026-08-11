@@ -278,12 +278,15 @@ capture all verified end to end.
 
 Known limitations:
 
-- **Absolute focus position requires a compatible lens.** The body supports
-  `CrDeviceProperty_FocusPositionSetting`, but the lens must provide position
-  telemetry or the property never appears (the FE 35mm F1.8 does not; Sony's
-  own RemoteCli reports "not supported" on the same combination). With an
-  unsupported lens, `get/set_focus_position` return an `[unsupported_value]`
-  error; a relative-stepping fallback via the near/far drive is a possible
-  future addition, confined to `crsdk_ext.cpp`.
+- **Absolute focus position is emulated.** The ILCE-7RM5 over USB refuses the
+  SDK's entire position-setting family (`FocusPositionSetting`,
+  `ZoomPositionSetting`, `ZoomAndFocusPreset`) with every lens, focus mode and
+  dial position tried — verified against Sony's own RemoteCli. What it does
+  honour is the relative near/far drive, so the module rebuilds absolute focus
+  on top of it: home into the lens's near stop, count nudges from there.
+  `get/set_focus_position` keep their API with `units: "emulated_nudges"`;
+  autofocus, manual nudges and reconnects invalidate the count and the next
+  focus operation re-homes. See `focus_emulation` and friends in the
+  [model reference](brad-grigsby_sony-remote_camera.md).
 - **`linux/amd64` artifacts only** until an ARM build host or CI pipeline is
   set up. The test suite and `"binding": "fake"` work anywhere Python does.
