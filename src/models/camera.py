@@ -173,6 +173,11 @@ class Camera(CameraBase, EasyResource):
         interval = attrs.get("emulated_nudge_interval_s")
         if interval is not None and (not _is_number(interval) or interval < 0):
             raise ValueError("`emulated_nudge_interval_s` must be >= 0")
+        focus_on_connect = attrs.get("focus_on_connect")
+        if focus_on_connect is not None and (
+            not _is_number(focus_on_connect) or focus_on_connect < 0
+        ):
+            raise ValueError("`focus_on_connect` must be a non-negative number")
 
         apply_on_connect = attrs.get("apply_on_connect")
         if apply_on_connect is not None:
@@ -220,6 +225,11 @@ class Camera(CameraBase, EasyResource):
             emulated_step_size=int(attr("emulated_step_size")),
             emulated_travel_nudges=int(attr("emulated_travel_nudges")),
             emulated_nudge_interval_s=float(attr("emulated_nudge_interval_s")),
+            focus_on_connect=(
+                int(attrs["focus_on_connect"])
+                if attrs.get("focus_on_connect") is not None
+                else None
+            ),
         )
 
         # Host checks only a real camera cares about; a fake-binding component

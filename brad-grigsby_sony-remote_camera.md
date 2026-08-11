@@ -53,6 +53,7 @@ Every attribute is optional.
 | `emulated_step_size` | number | `3` | Near/far magnitude (1–7) used for every emulated nudge. One position unit = one nudge of this size, so changing it invalidates stored focus tables. |
 | `emulated_travel_nudges` | number | `150` | Homing budget and position ceiling: this many nudges must cross the lens's full travel with margin. Calibrate per lens with `focus_near_far`. |
 | `emulated_nudge_interval_s` | number | `0.03` | Pause after each nudge, letting the drive settle. |
+| `focus_on_connect` | number | — | Drive focus to this position on every connect, including reconnects after a camera power cycle (which can physically move a power-zoom lens). With emulated focus this homes first. For a rig whose stations share one focus plane, this single number replaces all other focus handling; a failure is recorded in `apply_errors`, never fatal. |
 
 `apply_on_connect` values are validated all the way down to their raw SDK
 encoding when the machine config is saved, so a mistyped aperture is a config

@@ -309,6 +309,32 @@ class TestEmulatedFocus:
         assert status["focus_emulated"] is True
         assert status["focus_homed"] is True
 
+    def test_focus_on_connect_homes_and_sets_every_connect(self, make_session, fake):
+        fake.absolute_focus_supported = False
+        session = make_session(
+            fake,
+            emulated_nudge_interval_s=0,
+            emulated_travel_nudges=40,
+            emulated_step_size=3,
+            focus_on_connect=8,
+        )
+        assert wait_until(lambda: session.connected)
+        physical = fake.focus_min + 8 * 3 * fake.near_far_units_per_step
+        assert wait_until(lambda: fake.property_value("focus_position") == physical)
+        assert session.device_status()["focus_homed"] is True
+
+        # A power cycle physically moves a PZ lens; the reconnect must land
+        # focus back on the same plane with no help from the caller.
+        fake.unplug()
+        assert wait_until(lambda: not session.connected)
+        # Displacement within the homing budget (40 nudges x 6 units = 240) -
+        # which is also the real-world rule: emulated_travel_nudges must cover
+        # the whole travel, or homing can't guarantee the stop.
+        fake._properties["focus_position"]["value"] = 150
+        fake.plug_in()
+        assert wait_until(lambda: session.connected, timeout=5.0)
+        assert wait_until(lambda: fake.property_value("focus_position") == physical)
+
     def test_native_bodies_are_untouched(self, make_session, fake):
         session = make_session(fake)  # absolute focus supported
         assert wait_until(lambda: session.connected)

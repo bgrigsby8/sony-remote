@@ -128,6 +128,11 @@ class SessionConfig:
     emulated_step_size: int = 3
     emulated_travel_nudges: int = 150
     emulated_nudge_interval_s: float = 0.03
+    # Drive focus to this position on every connect (including reconnects
+    # after a camera power cycle, which can physically move the lens). With
+    # emulated focus this homes first, so the rig needs no focus logic
+    # anywhere else: one number here keeps every shot at the same plane.
+    focus_on_connect: Optional[int] = None
 
 
 class _Job:
@@ -492,6 +497,21 @@ class CameraSession:
                     f"{exc}",
                 )
             self._apply_on_connect()
+            if self._config.focus_on_connect is not None:
+                try:
+                    result = self._do_set_focus(
+                        int(self._config.focus_on_connect),
+                        int(self._config.focus_tolerance),
+                    )
+                    self._log(
+                        "info",
+                        f"focus_on_connect: position "
+                        f"{result['position']} ({result['units']})",
+                    )
+                except CameraError as exc:
+                    detail = f"focus_on_connect={self._config.focus_on_connect}: {exc}"
+                    self._apply_errors.append(detail)
+                    self._log("error", f"apply_on_connect failed for {detail}")
             try:
                 self._device = dict(self._binding.device_info())
             except CameraError:
