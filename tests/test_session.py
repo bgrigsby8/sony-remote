@@ -166,6 +166,23 @@ class TestApplyOnConnect:
         assert fake.property_value("still_file_format") == "RAW"
         assert fake.property_value("shutter_type") == "Mechanical"
 
+    def test_focus_near_far_nudges_and_clamps(self, make_session, fake):
+        # The relative drive under emulated absolute focus: signed steps move
+        # the (fake) lens, and driving into a stop clamps rather than errors -
+        # which is exactly what homing relies on.
+        session = make_session(fake)
+        assert wait_until(lambda: session.connected)
+        start = fake.property_value("focus_position")
+        assert session.focus_near_far(3) == {"step": 3}
+        assert fake.property_value("focus_position") == start + 3 * fake.near_far_units_per_step
+        session.focus_near_far(-7)
+        assert fake.property_value("focus_position") == max(
+            fake.focus_min, start + (3 - 7) * fake.near_far_units_per_step
+        )
+        for _ in range(200):
+            session.focus_near_far(-7)
+        assert fake.property_value("focus_position") == fake.focus_min
+
     def test_pc_remote_priority_is_taken_before_any_setting(self, make_session, fake):
         # A real body boots owning its shooting settings and rejects (or
         # silently ignores) remote sets until the PC takes priority - so the

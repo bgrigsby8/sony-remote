@@ -82,6 +82,9 @@ _DEFAULT_PROPERTIES: Dict[str, Dict[str, Any]] = {
         "value": "MemoryCard",
         "choices": ["HostPC", "MemoryCard", "HostPCAndMemoryCard"],
     },
+    # Relative focus drive (signed Int16 on the wire, two's complement).
+    # Setting it moves focus_position; see set_property.
+    "near_far": {"value": 0, "choices": []},
 }
 
 
@@ -122,6 +125,11 @@ class FakeCamera(CameraBinding):
         self.autofocus_position = 140
         # Set to raise BusyError from the next set_property / trigger_capture.
         self.busy_once = False
+        # near_far modelling: units of focus_position moved per unit of step
+        # magnitude, and the travel stops the drive clamps against.
+        self.near_far_units_per_step = 2
+        self.focus_min = 0
+        self.focus_max = 500
         # Extra cameras `enumerate` should report, to test the ambiguity guard.
         self.extra_devices: List[DeviceInfo] = []
 
@@ -280,6 +288,18 @@ class FakeCamera(CameraBinding):
             # commanded value, not on it.
             error = self.focus_error_sequence.pop(0) if self.focus_error_sequence else 0
             prop["value"] = value + error
+        elif name == "near_far":
+            # Signed Int16 on the wire (two's complement); each write nudges
+            # focus by `near_far_units_per_step` per unit of magnitude, clamped
+            # to the travel range like a real lens hitting its stops.
+            step = value - 0x10000 if value > 0x7FFF else value
+            moved = self._properties["focus_position"]["value"] + (
+                step * self.near_far_units_per_step
+            )
+            self._properties["focus_position"]["value"] = max(
+                self.focus_min, min(self.focus_max, moved)
+            )
+            prop["value"] = 0
         else:
             prop["value"] = value
         self._events.put(

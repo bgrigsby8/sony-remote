@@ -90,6 +90,12 @@ static const std::map<std::string, cr::CrDevicePropertyCode> kPropertyCodes = {
     // acts on THIS property - direct-to-host saving needs HostPC set here, or
     // the exposure happens and the image strands in the body's buffer.
     {"store_destination", cr::CrDeviceProperty_StillImageStoreDestination},
+    // Relative focus drive: signed Int16, -7..+7, one nudge per write (sign =
+    // near/far, magnitude = step size). The basis for emulated absolute focus
+    // on bodies that refuse FocusPositionSetting (the ILCE-7RM5 over USB does,
+    // with every lens and mode we could throw at it). Python masks negatives
+    // to 16-bit two's complement before the write.
+    {"near_far", cr::CrDeviceProperty_NearFar},
 };
 
 // Symbolic value <-> SDK enum, for the properties whose values are enums rather

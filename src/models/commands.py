@@ -58,6 +58,7 @@ _FLAT = (
     "get_focus_position",
     "set_focus_position",
     "autofocus_once",
+    "focus_near_far",
     "get_settings",
     "set_settings",
     "get_status",
@@ -248,6 +249,20 @@ class CommandHandler:
 
     async def _cmd_autofocus_once(self, opts: Mapping[str, Any]) -> Dict[str, ValueTypes]:
         return await _to_thread(self._session.autofocus_once)
+
+    async def _cmd_focus_near_far(self, opts: Mapping[str, Any]) -> Dict[str, ValueTypes]:
+        """One relative focus nudge. `step`: -7..7, negative = near.
+
+        The camera moves focus by a lens-dependent amount per nudge; this is
+        the calibration/bring-up primitive under emulated absolute focus.
+        """
+        step = opts.get("step")
+        if isinstance(step, bool) or not isinstance(step, (int, float)) or int(step) != step:
+            raise ValueError("`focus_near_far` needs an integer `step` (-7..7, not 0)")
+        step = int(step)
+        if step == 0 or not -7 <= step <= 7:
+            raise ValueError(f"`step` must be -7..7 and non-zero, got {step}")
+        return await _to_thread(self._session.focus_near_far, step)
 
     async def _cmd_get_settings(self, opts: Mapping[str, Any]) -> Dict[str, ValueTypes]:
         return await _to_thread(self._session.get_settings)

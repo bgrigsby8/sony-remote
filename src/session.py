@@ -286,6 +286,19 @@ class CameraSession:
             "autofocus_once", self._do_autofocus, timeout=self._config.autofocus_timeout_s
         )
 
+    def focus_near_far(self, step: int) -> Dict[str, Any]:
+        """One relative focus nudge: sign is direction (negative = near),
+        magnitude 1-7 is the step size. The raw primitive under emulated
+        absolute focus, exposed directly for calibration and bring-up.
+        """
+        return self._submit("focus_near_far", lambda: self._do_near_far(int(step)))
+
+    def _do_near_far(self, step: int) -> Dict[str, Any]:
+        # The property is signed Int16; the binding layer speaks unsigned, so
+        # encode two's complement here.
+        self._binding.set_property("near_far", step & 0xFFFF)
+        return {"step": step}
+
     def device_status(self) -> Dict[str, Any]:
         """Truthful status whether or not a camera is attached."""
         return self._submit("get_status", self._do_status, requires_connection=False)

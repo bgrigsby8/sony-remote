@@ -327,6 +327,18 @@ class TestNewCommands:
 
 
 class TestDispatch:
+    async def test_focus_near_far_validates_and_moves(self, camera):
+        before = camera.fake.property_value("focus_position")
+        result = await camera.do_command({"focus_near_far": {"step": -2}})
+        assert result["step"] == -2
+        assert (
+            camera.fake.property_value("focus_position")
+            == before - 2 * camera.fake.near_far_units_per_step
+        )
+        for bad in (0, 8, -8, 1.5, "near", None):
+            with pytest.raises(Exception):
+                await camera.do_command({"focus_near_far": {"step": bad}})
+
     async def test_named_command_style(self, camera):
         # The webapp uses `{"command": "..."}` against other modules on the same
         # machine; supporting both styles saves every caller from remembering
