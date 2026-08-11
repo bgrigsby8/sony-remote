@@ -102,6 +102,34 @@ def ensure_installed(
     return True
 
 
+def mirror_adapters(
+    dest_dirs, target: str = TARGET, log: Optional[Callable[[str], None]] = None
+) -> None:
+    """Copy CrAdapter/ from the install into each of `dest_dirs`.
+
+    libCr_Core dlopens its adapters relative to the *process* - the executable
+    directory and working directory - not relative to itself. Verified live on
+    an ILCE-7RM5: core loaded from /opt/sony-crsdk with adapters right beside
+    it enumerated nothing; the same session found the camera the moment
+    CrAdapter/ appeared in the process's directories. So the module mirrors it
+    there at configure time. Idempotent; failures are logged, not raised.
+    """
+    log = log or (lambda _msg: None)
+    source = os.path.join(target, "CrAdapter")
+    if not os.path.isdir(source):
+        return
+    for dest_dir in dest_dirs:
+        dest = os.path.join(dest_dir, "CrAdapter")
+        try:
+            if os.path.isdir(dest) and os.listdir(dest):
+                continue
+            shutil.copytree(source, dest, dirs_exist_ok=True)
+            log(f"mirrored {source} into {dest_dir} (libCr_Core loads adapters "
+                f"relative to the process)")
+        except OSError as exc:
+            log(f"could not mirror CrAdapter into {dest_dir}: {exc}")
+
+
 def _install_from_dir(source: str, target: str) -> None:
     # An extracted SDK (find external/crsdk below it), or a bare lib dir.
     candidates = [os.path.join(source, _LIB_SUBDIR.rstrip("/"))]

@@ -34,6 +34,7 @@ body - see `tests/`.
 
 import asyncio
 import os
+import sys
 from typing import (
     Any,
     ClassVar,
@@ -220,6 +221,14 @@ class Camera(CameraBase, EasyResource):
                     f"could not install the CrSDK libraries from "
                     f"{crsdk_archive}: {exc}"
                 )
+        if self._binding_kind == "native" and getattr(sys, "frozen", False):
+            # libCr_Core finds its adapters relative to the process, so they
+            # must exist next to the packaged binary and in the working
+            # directory - wherever viam-server unpacked us this time.
+            crsdk_install.mirror_adapters(
+                [os.path.dirname(sys.executable), os.getcwd()],
+                log=self.logger.info,
+            )
 
         old = getattr(self, "_session", None)
         if old is not None:

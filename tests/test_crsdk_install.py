@@ -70,6 +70,38 @@ class TestArchiveShapes:
         _assert_installed(target)
 
 
+class TestMirrorAdapters:
+    def test_mirrors_into_process_dirs(self, tmp_path, target):
+        inner = tmp_path / "RemoteCli.zip"
+        inner.write_bytes(_inner_zip_bytes())
+        crsdk_install.ensure_installed(str(inner), target)
+        exe_dir = tmp_path / "exe"
+        cwd_dir = tmp_path / "cwd"
+        exe_dir.mkdir()
+        cwd_dir.mkdir()
+        crsdk_install.mirror_adapters([str(exe_dir), str(cwd_dir)], target)
+        for d in (exe_dir, cwd_dir):
+            assert (d / "CrAdapter" / "libCr_PTP_USB.so").read_bytes() == b"usb"
+
+    def test_noop_when_nothing_installed(self, tmp_path, target):
+        # No /opt install yet -> nothing to mirror, nothing created.
+        dest = tmp_path / "exe"
+        dest.mkdir()
+        crsdk_install.mirror_adapters([str(dest)], target)
+        assert not (dest / "CrAdapter").exists()
+
+    def test_existing_copy_is_left_alone(self, tmp_path, target):
+        inner = tmp_path / "RemoteCli.zip"
+        inner.write_bytes(_inner_zip_bytes())
+        crsdk_install.ensure_installed(str(inner), target)
+        dest = tmp_path / "exe"
+        (dest / "CrAdapter").mkdir(parents=True)
+        marker = dest / "CrAdapter" / "libCr_PTP_USB.so"
+        marker.write_bytes(b"operator-managed")
+        crsdk_install.mirror_adapters([str(dest)], target)
+        assert marker.read_bytes() == b"operator-managed"
+
+
 class TestUsbfsWarning:
     def test_low_cap_warns_with_the_fix(self, tmp_path):
         knob = tmp_path / "usbfs_memory_mb"
