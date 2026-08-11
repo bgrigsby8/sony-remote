@@ -195,6 +195,10 @@ static cr::ICrEnumCameraObjectInfo* g_enum = nullptr;
 // model/serial property on every body, so this is the reliable source.
 static std::string g_model;
 static std::string g_serial;
+// Per-session cache of each property's declared value type (owner thread
+// only, like every SDK call here). Cleared on connect: a different body or
+// firmware may declare different widths.
+static std::map<cr::CrDevicePropertyCode, cr::CrDataType> g_value_types;
 
 [[noreturn]] static void fail(const char* category, int code, const std::string& text) {
     throw std::runtime_error(std::string(category) + "|" + std::to_string(code) + "|" + text);
@@ -507,6 +511,7 @@ static void ext_connect(int index, int timeout_ms) {
                           cr::CrSdkControlMode_Remote, cr::CrReconnecting_OFF);
     }
     check(err, "Connect");
+    g_value_types.clear();
     // Connect() only starts the handshake - the session is usable when
     // OnConnected fires (which sets g_connected). Property writes before that
     // bounce with Api_InvalidCalled, so block here until the callback lands.
@@ -636,9 +641,14 @@ static void ext_set_property(const std::string& name, py::object value) {
     // The body rejects a set whose declared value type doesn't match the
     // property's own (shutter_type came back 0x8402 when declared UInt32), so
     // ask the camera what type it reports and echo that back - Sony's sample
-    // hardcodes the exact width per property for the same reason.
+    // hardcodes the exact width per property for the same reason. Cached per
+    // session: the full-table query costs a USB round trip, and emulated
+    // focus writes near_far hundreds of times in a homing pass.
     cr::CrDataType value_type = cr::CrDataType_UInt32;
-    {
+    auto cached = g_value_types.find(code);
+    if (cached != g_value_types.end()) {
+        value_type = cached->second;
+    } else {
         py::gil_scoped_release unlock;
         cr::CrDeviceProperty* props = nullptr;
         CrInt32 count = 0;
@@ -646,6 +656,7 @@ static void ext_set_property(const std::string& name, py::object value) {
             for (CrInt32 i = 0; i < count; ++i) {
                 if (props[i].GetCode() == code) {
                     value_type = props[i].GetValueType();
+                    g_value_types[code] = value_type;
                     break;
                 }
             }
