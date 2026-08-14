@@ -303,7 +303,9 @@ class CameraSession:
     ) -> Dict[str, Any]:
         tol = int(self._config.focus_tolerance if tolerance is None else tolerance)
         return self._submit(
-            "set_focus_position", lambda: self._do_set_focus(int(position), tol)
+            "set_focus_position",
+            lambda: self._do_set_focus(int(position), tol),
+            timeout=self._focus_motion_budget_s(),
         )
 
     def autofocus_once(self) -> Dict[str, Any]:
@@ -314,7 +316,22 @@ class CameraSession:
     def home_focus(self) -> Dict[str, Any]:
         """Re-zero emulated focus against the near stop. No-op information on
         bodies with native absolute focus."""
-        return self._submit("home_focus", self._do_home_focus)
+        return self._submit(
+            "home_focus", self._do_home_focus, timeout=self._focus_motion_budget_s()
+        )
+
+    def _focus_motion_budget_s(self) -> float:
+        """Worst-case wall time for one emulated focus command.
+
+        `set_focus_position` may home first (a full travel of nudges) and then
+        move up to the full travel again, each nudge sleeping
+        `emulated_nudge_interval_s` - so the budget scales with the configured
+        motion instead of the fixed default, which a slow nudge interval or a
+        long travel would otherwise blow through mid-move.
+        """
+        travel = int(self._config.emulated_travel_nudges)
+        interval = max(float(self._config.emulated_nudge_interval_s), 0.005)
+        return 2 * travel * interval + 10.0
 
     def focus_near_far(self, step: int) -> Dict[str, Any]:
         """One relative focus nudge: sign is direction (negative = near),
