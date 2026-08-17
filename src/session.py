@@ -124,10 +124,15 @@ class SessionConfig:
     # one near/far write of magnitude `emulated_step_size` (1-7), and homing
     # drives `emulated_travel_nudges` nudges toward the near stop - size it so
     # that many nudges crosses the lens's whole travel with margin.
+    # The interval must exceed the lens's per-nudge move time: the body
+    # silently drops near/far writes that arrive while the lens is still
+    # moving (no error, no telemetry), which corrupts the position count.
+    # Calibrate per lens and step size by lowering it until `home_focus`
+    # stops short of the near stop, then back off with margin.
     focus_emulation: str = "auto"
     emulated_step_size: int = 3
     emulated_travel_nudges: int = 150
-    emulated_nudge_interval_s: float = 0.03
+    emulated_nudge_interval_s: float = 0.2
     # Drive focus to this position on every connect (including reconnects
     # after a camera power cycle, which can physically move the lens). With
     # emulated focus this homes first, so the rig needs no focus logic

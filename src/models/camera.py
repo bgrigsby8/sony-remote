@@ -75,7 +75,7 @@ _DEFAULTS: Dict[str, Any] = {
     "focus_emulation": "auto",
     "emulated_step_size": 3,
     "emulated_travel_nudges": 150,
-    "emulated_nudge_interval_s": 0.03,
+    "emulated_nudge_interval_s": 0.2,
 }
 
 _POSITIVE_NUMBERS = (
