@@ -66,6 +66,7 @@ from session import CameraSession, SessionConfig
 _DEFAULTS: Dict[str, Any] = {
     "capture_dir": "/tmp/sony-remote",
     "retention_max_files": 200,
+    "strict_capture_names": True,
     "live_view_max_fps": 10.0,
     "connect_timeout_s": 10.0,
     "capture_timeout_s": 15.0,
@@ -136,6 +137,10 @@ class Camera(CameraBase, EasyResource):
             raise ValueError(
                 "`retention_max_files` must be a non-negative number (0 disables retention)"
             )
+
+        strict_names = attrs.get("strict_capture_names")
+        if strict_names is not None and not isinstance(strict_names, bool):
+            raise ValueError("`strict_capture_names` must be true or false")
 
         for key in _POSITIVE_NUMBERS:
             value = attrs.get(key)
@@ -215,6 +220,7 @@ class Camera(CameraBase, EasyResource):
             capture_dir=os.path.expanduser(str(attr("capture_dir"))),
             serial=(str(serial).strip() or None) if serial else None,
             retention_max_files=int(attr("retention_max_files")),
+            strict_capture_names=bool(attr("strict_capture_names")),
             live_view_max_fps=float(attr("live_view_max_fps")),
             connect_timeout_s=float(attr("connect_timeout_s")),
             capture_timeout_s=float(attr("capture_timeout_s")),

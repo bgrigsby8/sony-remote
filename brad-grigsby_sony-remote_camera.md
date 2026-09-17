@@ -15,6 +15,7 @@ work, but only the A7R V is verified.
   "crsdk_archive": "/home/viam/CrSDK_v2.02.00_Linux64PC.zip",
   "capture_dir": "/tmp/sony-remote",
   "retention_max_files": 200,
+  "strict_capture_names": true,
   "live_view_max_fps": 10,
   "connect_timeout_s": 10,
   "capture_timeout_s": 15,
@@ -40,8 +41,9 @@ Every attribute is optional.
 |---|---|---|---|
 | `serial` | string | — | Which body to claim. Required if more than one Sony camera is on USB; with two cameras and no `serial`, the component refuses to connect and says so in `get_status.last_error` rather than picking one at random. Matched exactly or as a suffix. |
 | `crsdk_archive` | string | — | Path to the Camera Remote SDK zip downloaded from Sony (or an extracted copy). On configure, the module installs the SDK's runtime libraries from it into `/opt/sony-crsdk` if they aren't there yet, then never touches it again — the attribute can stay in the config. Sony's licence keeps these libraries out of the module itself; this automates the one manual install step (see the README's "Machine setup"). |
-| `capture_dir` | string | `/tmp/sony-remote` | Where the SDK writes stills. Created if missing. The module owns retention here. `~` is expanded. |
-| `retention_max_files` | number | `200` | Delete the oldest images beyond this after each capture. `0` disables retention. Non-image files (including the module's state file) are never touched. |
+| `capture_dir` | string | `/tmp/sony-remote` | Where the SDK writes stills. Created if missing. **Must be exclusive to this module** — nothing else should write here (see below). The module owns retention here. `~` is expanded. |
+| `retention_max_files` | number | `200` | After each capture, delete the oldest of *this module's own* stills beyond this count. `0` disables retention. Only files the module recorded writing (tracked in its state file) are counted or deleted; anything else in the directory — non-image files, the state file, another program's output, stills from before this tracking existed — is never touched. |
+| `strict_capture_names` | boolean | `true` | Only accept a new file as the capture if it is named the way Sony bodies name stills, `DSCnnnnn.<ext>` (an AdobeRGB body's `_DSC` prefix included), on top of the always-on check that its extension matches the current `file_format`. Set `false` only for a body configured with a custom file-name prefix. |
 | `live_view_max_fps` | number | `10` | Ceiling on how often live view is actually fetched from the camera. `get_images` calls inside the interval return the cached frame without a USB round trip. |
 | `connect_timeout_s` | number | `10` | Per-attempt connection timeout. Failures retry forever with capped exponential backoff. |
 | `capture_timeout_s` | number | `15` | How long `capture` waits for the still to reach `capture_dir`. A ceiling, not a delay — capture returns as soon as the file lands. |
@@ -66,6 +68,20 @@ working.
 `apply_on_connect` block: the rig fires a strobe and this body's electronic
 shutter reads the sensor progressively, so a flash would light only part of the
 frame. Set `"shutter_type": "auto"` to opt out.
+
+**`capture_dir` must be exclusive to this module.** Do not point another
+component's output (for example `color-correction`'s `output_dir`) at the same
+directory, and do not drop files into it by hand while the rig is shooting. The
+SDK writes the still into this directory on its own schedule, and on some
+bodies it reports completion without naming the file, so `capture` has to work
+out which new file is the shot. It only ever considers files whose extension the
+current `file_format` can produce and (with `strict_capture_names`) whose name is
+the camera's own `DSCnnnnn.<ext>`; if more than one candidate still appears for a
+shot it takes the newest and logs a warning naming them all. Retention likewise
+only deletes files this module itself wrote. Those guards are the safety net,
+not the design: a directory shared with another writer means a warning on every
+ambiguous shot and a directory that fills with files nobody prunes. Give each
+writer its own directory.
 
 ### Settings vocabulary
 

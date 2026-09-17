@@ -174,7 +174,7 @@ Every attribute is optional. Full reference, including every accepted value for
 each setting, is in
 [`brad-grigsby_sony-remote_camera.md`](brad-grigsby_sony-remote_camera.md).
 
-Two behaviours worth knowing up front:
+Three behaviours worth knowing up front:
 
 - **`shutter_type` defaults to `"mechanical"`** even if you supply no
   `apply_on_connect` at all. The rig fires a strobe, and this body's electronic
@@ -184,6 +184,14 @@ Two behaviours worth knowing up front:
   down to f/45 still connects and still shows live view; `get_status` reports
   what didn't stick in `apply_errors`. A config error must not leave you with a
   component too dead to debug.
+- **`capture_dir` is this module's alone.** Don't share it with another
+  component's output directory (`color-correction`'s `output_dir` in
+  particular). `capture` finds the still by diffing the directory when the SDK
+  doesn't name the file, and retention deletes what's over the limit; both are
+  filtered to the camera's own `DSCnnnnn.<ext>` files of the current
+  `file_format`, and retention to files this module recorded writing, but a
+  shared directory still means warnings on ambiguous shots and files nobody
+  prunes. Details in the model README.
 
 ## Compatibility with `ptp`
 

@@ -489,6 +489,187 @@ class TestCapture:
         assert len({r["path"] for r in results}) == 3
 
 
+class TestSharedCaptureDir:
+    """`capture_dir` shared with another program.
+
+    Production, 2026-09-17, file_format=raw, capture_dir also color-correction's
+    output_dir: that component exported DSC00432.jpg between our pre-shutter
+    snapshot and the SDK's file_written, and the capture came back as the jpg
+    while DSC00470.ARW landed unreported. Seven times in twenty minutes. The
+    directory should be exclusive (README), but the module must not be fooled
+    when it isn't.
+    """
+
+    def test_a_foreign_jpg_is_not_the_capture_when_the_sdk_names_the_file(
+        self, make_session, fake, capture_dir
+    ):
+        fake.foreign_files = ["DSC00432.jpg"]
+        session = make_session(fake)
+        assert wait_until(lambda: session.connected)
+
+        result = session.capture()
+
+        assert result["path"].endswith(".ARW")
+        assert result["paths"] == [result["path"]]
+        assert not any("DSC00432" in p for p in result["paths"])
+        assert os.path.exists(os.path.join(capture_dir, "DSC00432.jpg"))
+
+    def test_a_foreign_jpg_is_not_the_capture_on_the_diff_fallback(
+        self, make_session, capture_dir
+    ):
+        # The exact production path: the SDK build names no file, the diff
+        # finds the stranger's jpg *and* the body's RAW, and "raw" can't be
+        # a jpg.
+        fake = FakeCamera(emit_file_path=False)
+        fake.foreign_files = ["DSC00432.jpg"]
+        session = make_session(fake)
+        assert wait_until(lambda: session.connected)
+
+        result = session.capture()
+
+        assert result["path"].endswith(".ARW")
+        assert result["paths"] == [result["path"]]
+        assert os.path.exists(result["path"])
+        assert os.path.exists(os.path.join(capture_dir, "DSC00432.jpg"))
+
+    def test_a_foreign_jpg_only_arriving_does_not_satisfy_the_capture(
+        self, make_session, capture_dir
+    ):
+        # Body writes nothing; the stranger's jpg alone must read as "no file",
+        # not as the shot.
+        fake = FakeCamera(emit_file_path=False, drop_capture=True)
+        session = make_session(fake, capture_timeout_s=0.5)
+        assert wait_until(lambda: session.connected)
+
+        def stranger():
+            time.sleep(0.05)
+            with open(os.path.join(capture_dir, "DSC00432.jpg"), "wb") as handle:
+                handle.write(b"\xff\xd8" + b"x" * 512)
+
+        threading.Thread(target=stranger, daemon=True).start()
+        with pytest.raises(CaptureTimeoutError):
+            session.capture()
+
+    def test_a_stranger_with_the_right_extension_but_the_wrong_name_is_ignored(
+        self, make_session, logger
+    ):
+        fake = FakeCamera(emit_file_path=False)
+        fake.foreign_files = ["render.ARW"]
+        session = make_session(fake)
+        assert wait_until(lambda: session.connected)
+
+        result = session.capture()
+
+        assert os.path.basename(result["path"]).startswith("DSC")
+        assert "render.ARW" not in logger.text("warning")
+
+    def test_strict_names_off_lets_a_custom_prefix_through(self, make_session, logger):
+        # The escape hatch for a body configured with its own file prefix. The
+        # stranger becomes a candidate, so the ambiguity is now logged - which
+        # is the point of the default being on.
+        fake = FakeCamera(emit_file_path=False)
+        fake.foreign_files = ["render.ARW"]
+        session = make_session(fake, strict_capture_names=False)
+        assert wait_until(lambda: session.connected)
+
+        result = session.capture()
+
+        assert os.path.basename(result["path"]).startswith("DSC")
+        assert "render.ARW" in logger.text("warning")
+
+    def test_a_file_written_event_for_the_wrong_type_is_ignored(
+        self, make_session, capture_dir, logger
+    ):
+        # Even the SDK's own word isn't taken for a file the format can't
+        # produce.
+        fake = FakeCamera(capture_delay_s=0.3)
+        session = make_session(fake)
+        assert wait_until(lambda: session.connected)
+        foreign = os.path.join(capture_dir, "DSC00432.jpg")
+
+        def announce_stranger():
+            time.sleep(0.05)
+            with open(foreign, "wb") as handle:
+                handle.write(b"\xff\xd8" + b"x" * 512)
+            fake.push_event("file_written", path=foreign)
+
+        threading.Thread(target=announce_stranger, daemon=True).start()
+        result = session.capture()
+
+        assert result["path"].endswith(".ARW")
+        assert "ignoring file_written" in logger.text("warning")
+        assert "DSC00432.jpg" in logger.text("warning")
+
+    def test_too_many_candidates_takes_the_newest_and_says_so(
+        self, make_session, capture_dir, logger
+    ):
+        # Two camera-named RAWs appear for one shot and nothing was named by
+        # the SDK: pick the newest, and log the whole line-up rather than
+        # silently taking whichever sorted first.
+        fake = FakeCamera(emit_file_path=False)
+        fake.foreign_files = ["DSC00999.ARW"]
+        session = make_session(fake)
+        assert wait_until(lambda: session.connected)
+
+        result = session.capture()
+
+        assert os.path.basename(result["path"]) == "DSC00001.ARW"
+        warning = logger.text("warning")
+        assert "2 new files" in warning
+        assert "DSC00999.ARW" in warning
+        assert "DSC00001.ARW" in warning
+        assert "exclusive" in warning
+
+    def test_the_sdk_named_file_wins_over_a_newer_stranger(self, make_session, logger):
+        session = make_session()
+        diffed = ["/d/DSC00001.ARW", "/d/DSC00002.ARW", "/d/DSC00003.ARW"]
+
+        assert session._choose_candidates(diffed, ["/d/DSC00001.ARW"], 1) == [
+            "/d/DSC00001.ARW"
+        ]
+        # Partial naming in RAW+JPEG: the named one plus the newest other.
+        assert session._choose_candidates(diffed, ["/d/DSC00001.ARW"], 2) == [
+            "/d/DSC00001.ARW",
+            "/d/DSC00003.ARW",
+        ]
+        # Nothing named: newest N, in directory order.
+        assert session._choose_candidates(diffed, [], 2) == [
+            "/d/DSC00002.ARW",
+            "/d/DSC00003.ARW",
+        ]
+        # Exactly as many as expected: no choice, no warning.
+        assert session._choose_candidates(diffed[:1], [], 1) == diffed[:1]
+        assert logger.text("warning").count("new files appeared") == 3
+
+    def test_retention_never_deletes_foreign_files(self, make_session, fake, capture_dir):
+        fake.foreign_files = ["DSC00432.jpg"]
+        session = make_session(fake, retention_max_files=2)
+        assert wait_until(lambda: session.connected)
+
+        for _ in range(4):
+            session.capture()
+
+        foreign = os.path.join(capture_dir, "DSC00432.jpg")
+        assert os.path.exists(foreign)
+        owned = [os.path.basename(p) for p in session.store.list_owned()]
+        assert owned == ["DSC00003.ARW", "DSC00004.ARW"]
+        assert len(session.store.list_images()) == 3
+
+    def test_retention_only_counts_our_own_files(self, make_session, fake, capture_dir):
+        # Strangers don't eat into the budget either: with two of theirs
+        # present and max_files=2, both of ours stay.
+        fake.foreign_files = ["DSC00432.jpg", "DSC00433.jpg"]
+        session = make_session(fake, retention_max_files=2)
+        assert wait_until(lambda: session.connected)
+
+        session.capture()
+        session.capture()
+
+        assert len(session.store.list_owned()) == 2
+        assert len(session.store.list_images()) == 4
+
+
+
 # ----------------------------------------------------------------------
 # Focus
 # ----------------------------------------------------------------------
