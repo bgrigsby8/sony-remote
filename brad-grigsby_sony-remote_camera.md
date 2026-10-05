@@ -67,6 +67,11 @@ working.
 shutter reads the sensor progressively, so a flash would light only part of the
 frame. Set `"shutter_type": "auto"` to opt out.
 
+| `zoom_tolerance_mm` | number | `0` | How far a `set_zoom` read-back may be from the target and still count as landed. `0` means exactly on a reportable position, which the closed loop reaches in 1-3 passes on the FE PZ 16-35. |
+| `zoom_timeout_s` | number | `20` | Ceiling on one `set_zoom` (or `zoom_on_connect`). |
+| `zoom_max_drive_s` | number | `10` | Watchdog for an open-ended `zoom_drive` (no `duration_s`): the lens is stopped this long after the last drive command if nothing stops it first. |
+| `zoom_on_connect` | number | — | Drive zoom to this focal length (mm) on every connect, before `focus_on_connect` (zooming can move a PZ lens's focus group). A failure is recorded in `apply_errors`, never fatal. |
+
 ### Settings vocabulary
 
 Used by `apply_on_connect`, `set_settings` and returned by `get_settings`.
@@ -245,6 +250,78 @@ Works whether or not a camera is attached — `connected` reflects the truth and
 `last_error` says why not. `model` and `serial` are the last-known values when
 disconnected. `apply_errors` lists any `apply_on_connect` values the camera
 refused.
+
+### Zoom (power-zoom lenses)
+
+The body refuses `ZoomPositionSetting` over USB, as it does focus, but it
+reports the focal length (`ZoomDistance`), so absolute zoom is a closed loop
+over the continuous zoom drive, in real millimetres. Nothing needs homing.
+Any zoom movement invalidates emulated focus, and the next focus operation
+re-homes.
+
+```json
+{"get_zoom": {}}
+```
+```json
+{"focal_length_mm": 24.0, "min_mm": 16.0, "max_mm": 35.0, "step_mm": 0.1,
+ "speed_range": [-8, 8], "drive_available": true, "driving": false,
+ "zoom_type": "optical", "scale": 1.0,
+ "bar": {"boxes": 1, "box": 0, "position_pct": 42}, "units": "mm"}
+```
+
+`drive_available: false` means no power-zoom lens (or the body is busy).
+`step_mm` is what the body advertises. The FE PZ 16-35 actually reads back in
+0.5mm steps.
+
+```json
+{"set_zoom": {"focal_length_mm": 24}}
+{"set_zoom": {"mm": 24, "tolerance_mm": 0.5}}
+```
+```json
+{"focal_length_mm": 24.0, "target_mm": 24.0, "tolerance_mm": 0.0,
+ "passes": 2, "ok": true, "resolution_limited": false, "units": "mm"}
+```
+
+Drives toward the target at a speed scaled to the distance, stops, waits for
+the lens to stop coasting, and corrects at halved speed after each overshoot.
+A target outside the lens is clamped. A target between two reportable
+positions (25.2mm on a lens that reads 25.0/25.5) ends with
+`resolution_limited: true` on the closer one, rather than hunting. Like
+`set_focus_position`, a miss is `ok: false`, not an error.
+
+```json
+{"zoom_drive": {"speed": 3, "duration_s": 0.5}}
+{"zoom_drive": {"speed": -8}}
+{"zoom_stop": {}}
+```
+
+The raw drive: `speed` > 0 is tele and < 0 is wide, magnitude up to
+`speed_range` (clamped). With `duration_s` it moves, stops, and returns the
+settled focal length. Without it the lens keeps moving until `zoom_stop`,
+another drive, or the `zoom_max_drive_s` watchdog. That is the primitive for
+press-and-hold jog buttons. At speed 8 the FE PZ 16-35 crosses its whole
+range in about 1s.
+
+```json
+{"zoom_preset_save": {"slot": 1}}
+{"zoom_preset_load": {"slot": 1}}
+```
+
+The body's own presets (`ZoomAndFocusPosition_Save/Load`) store zoom **and**
+focus in the camera and survive its init. Loading takes up to ~2s to start
+moving, and the answer reports the focal length after the lens settles.
+
+### `set_property_raw` (diagnostic)
+
+```json
+{"set_property_raw": {"name": "zoom_operation", "value": -1, "value_type": "0x2002"}}
+```
+
+Writes a known property with an explicit value and declared `CrDataType`,
+bypassing every encoding rule. This is for bring-up questions like "which
+encoding does this body honour". It is how the zoom drive's wide direction
+was found to need RemoteCli's `UInt16Array` declaration: declared as the
+reported `Int8`, negative speeds are accepted and silently ignored.
 
 ### `capture_count`
 

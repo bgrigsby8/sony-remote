@@ -89,6 +89,31 @@ _FOCUS_SETTLE_S = 0.15
 # count on, so the contract is "within tolerance", not "exact".
 _DEFAULT_FOCUS_TOLERANCE = 2
 
+# Power zoom. The drive (`zoom_operation`) is continuous - a speed starts the
+# lens moving and only a 0 write stops it - so every zoom path ends in a stop
+# write, and a drive started without a duration is stopped by the owner thread
+# after `zoom_max_drive_s` even if the caller never sends one.
+# How often the closed loop re-reads `zoom_distance` while the lens moves.
+_ZOOM_POLL_S = 0.03
+# After a stop the lens coasts (seen on the FE PZ 16-35: a read 0.2s after
+# the stop said 19.5mm, the next call found it at 20). A read-back is trusted
+# once it has held still this long, or after the cap regardless.
+_ZOOM_STABLE_S = 0.25
+_ZOOM_SETTLE_MAX_S = 2.0
+# A preset load is accepted at once but the lens starts moving noticeably
+# later (longer than _ZOOM_STABLE_S on the FE PZ 16-35), and this body has no
+# ZoomDrivingStatus to ask. Wait this long for motion to begin before settling;
+# loading the preset you're already at pays it in full.
+_ZOOM_PRESET_START_S = 2.0
+# A drive whose reading hasn't changed for this long has hit an end stop (or
+# the body ignored the write); stop instead of waiting out the timeout.
+_ZOOM_STALL_S = 1.0
+# Corrective passes before `set_zoom` reports ok=false. Each pass after an
+# overshoot halves the speed, so this bounds a hunt, not a normal move.
+_ZOOM_MAX_PASSES = 8
+# Zoom_Operation_Status value meaning "the drive will be honoured".
+_ZOOM_ENABLED = 1
+
 # Focus modes in which the focus position property is writable. Anything else
 # and the lens is under the body's AF control, and a write either errors or is
 # silently overridden on the next half-press.
@@ -138,6 +163,19 @@ class SessionConfig:
     # emulated focus this homes first, so the rig needs no focus logic
     # anywhere else: one number here keeps every shot at the same plane.
     focus_on_connect: Optional[int] = None
+    # Power zoom (needs a PZ lens). Positions are focal lengths in mm, read
+    # back from the body, so `set_zoom` is closed-loop - unlike focus, nothing
+    # here is emulated or needs homing.
+    # 0 = land exactly on the lens's reported step (0.5mm on the FE PZ
+    # 16-35), which the closed loop reaches in 1-3 passes in practice.
+    zoom_tolerance_mm: float = 0.0
+    zoom_timeout_s: float = 20.0
+    # Watchdog for `zoom_drive` without a duration (press-and-hold jogging):
+    # the lens is stopped this long after the last drive command.
+    zoom_max_drive_s: float = 10.0
+    # Drive zoom to this focal length (mm) on every connect, before
+    # focus_on_connect - zooming can move the focus group on a PZ lens.
+    zoom_on_connect: Optional[float] = None
 
 
 class _Job:
@@ -210,6 +248,10 @@ class CameraSession:
         self._focus_probe: Optional[bool] = None
         self._focus_homed = False
         self._focus_counter = 0
+
+        # Open-ended zoom drive watchdog (owner thread only): monotonic time
+        # at which a running `zoom_drive` without a duration gets stopped.
+        self._zoom_drive_deadline: Optional[float] = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -296,6 +338,14 @@ class CameraSession:
     def dump_properties(self) -> List[Dict[str, Any]]:
         return self._submit("dump_properties", self._binding.dump_properties)
 
+    def set_property_raw(self, name: str, value: int, value_type: int) -> Dict[str, Any]:
+        def run():
+            self._binding.set_property_raw(name, value, value_type)
+            self._state_cache = None
+            return {"name": name, "value": value, "value_type": f"0x{value_type:X}"}
+
+        return self._submit("set_property_raw", run)
+
     def set_settings(self, values: Dict[str, Any]) -> Dict[str, Any]:
         encoded = settings_mod.validate_all(values)  # raises before touching the camera
         return self._submit("set_settings", lambda: self._do_set_settings(encoded))
@@ -352,6 +402,38 @@ class CameraSession:
         # A manual nudge moves the lens outside the emulated count.
         self._focus_homed = False
         return {"step": step}
+
+    def get_zoom(self) -> Dict[str, Any]:
+        return self._submit("get_zoom", self._do_get_zoom)
+
+    def zoom_drive(self, speed: int, duration_s: Optional[float] = None) -> Dict[str, Any]:
+        """Run the power zoom at `speed` (positive = tele, negative = wide,
+        0 = stop). With `duration_s` it blocks, then stops; without it the
+        lens keeps moving until the next drive/stop or the watchdog
+        (`zoom_max_drive_s`) - the press-and-hold jog primitive."""
+        timeout = (float(duration_s) if duration_s else 0.0) + 10.0
+        return self._submit(
+            "zoom_drive", lambda: self._do_zoom_drive(int(speed), duration_s), timeout=timeout
+        )
+
+    def set_zoom(
+        self, focal_length_mm: float, tolerance_mm: Optional[float] = None
+    ) -> Dict[str, Any]:
+        tol = float(self._config.zoom_tolerance_mm if tolerance_mm is None else tolerance_mm)
+        return self._submit(
+            "set_zoom",
+            lambda: self._do_set_zoom(float(focal_length_mm), tol),
+            timeout=float(self._config.zoom_timeout_s) + 5.0,
+        )
+
+    def zoom_preset(self, action: str, slot: int) -> Dict[str, Any]:
+        """Save the current zoom+focus into a body preset slot, or drive back
+        to one. Presets live in the camera and survive its init."""
+        return self._submit(
+            f"zoom_preset_{action}",
+            lambda: self._do_zoom_preset(action, int(slot)),
+            timeout=float(self._config.zoom_timeout_s) + 5.0,
+        )
 
     def device_status(self) -> Dict[str, Any]:
         """Truthful status whether or not a camera is attached."""
@@ -441,6 +523,12 @@ class CameraSession:
                         next_attempt = time.monotonic() + backoff
                         backoff = min(backoff * 2, _BACKOFF_MAX_S)
 
+                if (
+                    self._zoom_drive_deadline is not None
+                    and time.monotonic() >= self._zoom_drive_deadline
+                ):
+                    self._zoom_watchdog_stop()
+
                 wait = _IDLE_TICK_S
                 if not self._connected:
                     wait = max(0.01, min(_IDLE_TICK_S, next_attempt - time.monotonic()))
@@ -519,6 +607,22 @@ class CameraSession:
                     f"{exc}",
                 )
             self._apply_on_connect()
+            self._zoom_drive_deadline = None
+            if self._config.zoom_on_connect is not None:
+                try:
+                    result = self._do_set_zoom(
+                        float(self._config.zoom_on_connect),
+                        float(self._config.zoom_tolerance_mm),
+                    )
+                    self._log(
+                        "info",
+                        f"zoom_on_connect: {result['focal_length_mm']}mm "
+                        f"(ok={result['ok']})",
+                    )
+                except CameraError as exc:
+                    detail = f"zoom_on_connect={self._config.zoom_on_connect}: {exc}"
+                    self._apply_errors.append(detail)
+                    self._log("error", f"apply_on_connect failed for {detail}")
             if self._config.focus_on_connect is not None:
                 try:
                     result = self._do_set_focus(
@@ -662,6 +766,7 @@ class CameraSession:
                 )
             self._connected = False
             self._last_error = "camera disconnected"
+            self._zoom_drive_deadline = None
             self._clear_frame()
             self._state_cache = None
             try:
@@ -1054,6 +1159,307 @@ class CameraSession:
         if not acquired:
             self._log("warning", f"one-shot AF did not lock; focus is at {position}")
         return {"position": position, "units": "sdk_raw", "acquired": acquired}
+
+    # ------------------------------------------------------------------
+    # Power zoom - owner thread only
+    #
+    # Zoom_Operation is a continuous drive and ZoomPositionSetting is refused
+    # over USB, but ZoomDistance (the focal length, 0.001mm) is readable. So
+    # absolute zoom is a closed loop - drive toward the target, poll, stop,
+    # re-read, correct at lower speed - and positions are real millimetres
+    # rather than counts. Zooming a PZ lens can move its focus group, so any
+    # zoom movement invalidates emulated focus and the next focus op re-homes.
+    # ------------------------------------------------------------------
+
+    def _read_optional(self, name: str):
+        try:
+            return self._binding.get_property(name)
+        except CameraError:
+            return None
+
+    def _zoom_distance_um(self) -> int:
+        prop = self._read_optional("zoom_distance")
+        if prop is None or prop.value is None:
+            raise UnsupportedValueError(
+                "this body/lens does not report a zoom focal length; set_zoom "
+                "needs a power-zoom lens"
+            )
+        return int(prop.value)
+
+    def _zoom_speed_limits(self) -> Tuple[int, int]:
+        """(slowest-wide, fastest-tele) bounds; (-1, 1) when the body doesn't
+        report a range, which is what Sony's sample assumes too."""
+        prop = self._read_optional("zoom_speed_range")
+        if prop is not None and len(prop.choices) >= 2:
+            lo, hi = int(prop.choices[0]), int(prop.choices[1])
+            if lo < 0 < hi:
+                return lo, hi
+        return -1, 1
+
+    def _require_zoom_drive(self) -> None:
+        prop = self._read_optional("zoom_operation_status")
+        if prop is None or int(prop.value or 0) != _ZOOM_ENABLED:
+            raise UnsupportedValueError(
+                "the zoom drive is not available (Zoom_Operation_Status is not "
+                "Enable): it needs a power-zoom lens, optical zoom, and the "
+                "body not busy"
+            )
+
+    def _write_zoom_speed(self, speed: int) -> None:
+        self._binding.set_property("zoom_operation", int(speed))
+        if speed != 0:
+            self._note_zoom_moved()
+
+    def _stop_zoom(self) -> None:
+        """Must not raise: it runs on every exit path of a drive."""
+        self._zoom_drive_deadline = None
+        try:
+            self._binding.set_property("zoom_operation", 0)
+        except CameraError as exc:
+            self._log("warning", f"zoom stop write failed: {exc}")
+
+    def _zoom_watchdog_stop(self) -> None:
+        self._log(
+            "warning",
+            f"zoom drive still running after {self._config.zoom_max_drive_s}s "
+            "with no new command; stopping it",
+        )
+        self._stop_zoom()
+
+    def _note_zoom_moved(self) -> None:
+        self._state_cache = None
+        if self._focus_probe and self._focus_homed:
+            self._focus_homed = False
+            self._log(
+                "info",
+                "zoom moved the lens; emulated focus re-homes on the next "
+                "focus operation",
+            )
+
+    def _do_get_zoom(self) -> Dict[str, Any]:
+        out: Dict[str, Any] = {"units": "mm"}
+        dist = self._read_optional("zoom_distance")
+        if dist is not None and dist.value is not None:
+            out["focal_length_mm"] = int(dist.value) / 1000.0
+            if dist.range and len(dist.choices) >= 2:
+                out["min_mm"] = int(dist.choices[0]) / 1000.0
+                out["max_mm"] = int(dist.choices[1]) / 1000.0
+                if len(dist.choices) >= 3 and int(dist.choices[2]) > 0:
+                    out["step_mm"] = int(dist.choices[2]) / 1000.0
+        else:
+            out["focal_length_mm"] = None
+        lo, hi = self._zoom_speed_limits()
+        out["speed_range"] = [lo, hi]
+        status = self._read_optional("zoom_operation_status")
+        out["drive_available"] = (
+            status is not None and int(status.value or 0) == _ZOOM_ENABLED
+        )
+        bar = self._read_optional("zoom_bar")
+        if bar is not None and bar.value is not None:
+            raw = int(bar.value)
+            # Bits 31-24 total boxes, 23-16 current box, 15-0 position 0-100
+            # within it: the same bar the body draws on its own screen.
+            out["bar"] = {
+                "boxes": (raw >> 24) & 0xFF,
+                "box": (raw >> 16) & 0xFF,
+                "position_pct": raw & 0xFFFF,
+            }
+        scale = self._read_optional("zoom_scale")
+        if scale is not None and scale.value is not None:
+            out["scale"] = int(scale.value) / 1000.0
+        ztype = self._read_optional("zoom_type_status")
+        if ztype is not None and ztype.value is not None:
+            out["zoom_type"] = {1: "optical", 2: "smart", 3: "clear_image", 4: "digital"}.get(
+                int(ztype.value), int(ztype.value)
+            )
+        out["driving"] = self._zoom_drive_deadline is not None
+        return out
+
+    def _clamp_speed(self, speed: int) -> int:
+        lo, hi = self._zoom_speed_limits()
+        clamped = max(lo, min(hi, int(speed)))
+        if clamped != speed:
+            self._log("warning", f"zoom speed {speed} clamped to {clamped} (range {lo}..{hi})")
+        return clamped
+
+    def _do_zoom_drive(self, speed: int, duration_s: Optional[float]) -> Dict[str, Any]:
+        if speed == 0:
+            self._stop_zoom()
+            return {"speed": 0, "driving": False, **self._zoom_reading()}
+        self._require_zoom_drive()
+        speed = self._clamp_speed(speed)
+        if duration_s:
+            try:
+                self._write_zoom_speed(speed)
+                time.sleep(max(0.0, float(duration_s)))
+            finally:
+                self._stop_zoom()
+            return {
+                "speed": speed,
+                "driving": False,
+                "focal_length_mm": self._settled_zoom_um() / 1000.0,
+            }
+        self._write_zoom_speed(speed)
+        self._zoom_drive_deadline = time.monotonic() + float(self._config.zoom_max_drive_s)
+        return {"speed": speed, "driving": True, **self._zoom_reading()}
+
+    def _settled_zoom_um(self) -> int:
+        """Read the focal length once the lens has stopped coasting."""
+        current = self._zoom_distance_um()
+        stable_since = time.monotonic()
+        give_up = stable_since + _ZOOM_SETTLE_MAX_S
+        while time.monotonic() < give_up:
+            time.sleep(_ZOOM_POLL_S)
+            reading = self._zoom_distance_um()
+            if reading != current:
+                current = reading
+                stable_since = time.monotonic()
+            elif time.monotonic() - stable_since >= _ZOOM_STABLE_S:
+                break
+        return current
+
+    def _zoom_reading(self) -> Dict[str, Any]:
+        try:
+            return {"focal_length_mm": self._zoom_distance_um() / 1000.0}
+        except CameraError:
+            return {"focal_length_mm": None}
+
+    def _do_set_zoom(self, target_mm: float, tolerance_mm: float) -> Dict[str, Any]:
+        self._require_zoom_drive()
+        dist = self._binding.get_property("zoom_distance")
+        target = int(round(target_mm * 1000))
+        tol = max(0, int(round(tolerance_mm * 1000)))
+        if dist.range and len(dist.choices) >= 2:
+            lo_um, hi_um = int(dist.choices[0]), int(dist.choices[1])
+            clamped = max(lo_um, min(hi_um, target))
+            if clamped != target:
+                self._log(
+                    "warning",
+                    f"zoom target {target_mm}mm clamped to {clamped / 1000}mm "
+                    f"(lens range {lo_um / 1000}-{hi_um / 1000}mm)",
+                )
+                target = clamped
+            span = max(1, hi_um - lo_um)
+            step = int(dist.choices[2]) if len(dist.choices) >= 3 else 0
+            if step > 0:
+                # The body only reports focal lengths on its step grid; a
+                # target between grid points can never read back, so aim for
+                # the nearest one instead of hunting.
+                snapped = lo_um + int(round((target - lo_um) / step)) * step
+                snapped = max(lo_um, min(hi_um, snapped))
+                if snapped != target:
+                    self._log(
+                        "debug",
+                        f"zoom target {target / 1000}mm snapped to the lens's "
+                        f"{step / 1000}mm grid: {snapped / 1000}mm",
+                    )
+                    target = snapped
+        else:
+            span = max(1, abs(target - int(dist.value)) * 4)
+
+        _, max_speed = self._zoom_speed_limits()
+        deadline = time.monotonic() + float(self._config.zoom_timeout_s)
+        current = int(dist.value)
+        passes = 0
+        speed_cap = max_speed
+        last_direction = 0
+        min_speed_reversals = 0
+        best = current
+        resolution_limited = False
+        try:
+            while abs(target - current) > tol and passes < _ZOOM_MAX_PASSES:
+                if time.monotonic() >= deadline:
+                    break
+                error = target - current
+                direction = 1 if error > 0 else -1
+                if last_direction and direction != last_direction:
+                    if speed_cap == 1:
+                        # Overshooting back and forth at the slowest speed:
+                        # the target sits between two positions this lens can
+                        # report (the FE PZ 16-35 advertises a 0.1mm step but
+                        # reads back in 0.5mm), so more passes only hunt.
+                        min_speed_reversals += 1
+                        if min_speed_reversals >= 2:
+                            resolution_limited = True
+                            break
+                    # Overshot: come back slower so the next stop lands closer.
+                    speed_cap = max(1, speed_cap // 2)
+                last_direction = direction
+                passes += 1
+                fraction = abs(error) / span
+                if fraction > 0.25:
+                    magnitude = max_speed
+                elif fraction > 0.05:
+                    magnitude = max(1, (max_speed + 1) // 2)
+                else:
+                    magnitude = 1
+                magnitude = min(magnitude, speed_cap)
+
+                self._write_zoom_speed(direction * magnitude)
+                last_change = time.monotonic()
+                previous = current
+                while time.monotonic() < deadline:
+                    time.sleep(_ZOOM_POLL_S)
+                    current = self._zoom_distance_um()
+                    if (target - current) * direction <= tol:
+                        break  # reached or crossed the target window
+                    if current != previous:
+                        previous = current
+                        last_change = time.monotonic()
+                    elif time.monotonic() - last_change >= _ZOOM_STALL_S:
+                        break  # end stop, or the body ignored the drive
+                self._stop_zoom()
+                current = self._settled_zoom_um()
+                if abs(target - current) < abs(target - best):
+                    best = current
+            if resolution_limited and best != current:
+                # Finish on the closer of the two bracketing positions.
+                direction = 1 if best > current else -1
+                self._write_zoom_speed(direction)
+                while time.monotonic() < deadline:
+                    time.sleep(_ZOOM_POLL_S)
+                    if (best - self._zoom_distance_um()) * direction <= 0:
+                        break
+                self._stop_zoom()
+                current = self._settled_zoom_um()
+        finally:
+            self._stop_zoom()
+
+        ok = abs(target - current) <= tol
+        if not ok:
+            self._log(
+                "warning",
+                f"zoom did not reach {target / 1000}mm after {passes} pass(es): "
+                f"at {current / 1000}mm (tolerance {tol / 1000}mm)",
+            )
+        return {
+            "focal_length_mm": current / 1000.0,
+            "target_mm": target / 1000.0,
+            "tolerance_mm": tol / 1000.0,
+            "passes": passes,
+            "ok": ok,
+            "resolution_limited": resolution_limited,
+            "units": "mm",
+        }
+
+    def _do_zoom_preset(self, action: str, slot: int) -> Dict[str, Any]:
+        if not 0 <= slot <= 255:
+            raise UnsupportedValueError(f"preset slot must be 0..255, got {slot}")
+        if action == "save":
+            self._binding.set_property("zoom_focus_preset_save", slot)
+        elif action == "load":
+            before = self._zoom_distance_um()
+            self._binding.set_property("zoom_focus_preset_load", slot)
+            give_up = time.monotonic() + _ZOOM_PRESET_START_S
+            while time.monotonic() < give_up and self._zoom_distance_um() == before:
+                time.sleep(_ZOOM_POLL_S)
+            # The body restores focus as well as zoom, behind the emulation's
+            # back; _note_zoom_moved invalidates both.
+            self._note_zoom_moved()
+            self._settled_zoom_um()
+        else:
+            raise UnsupportedValueError(f"unknown preset action {action!r}")
+        return {"action": action, "slot": slot, **self._zoom_reading()}
 
     def _do_status(self) -> Dict[str, Any]:
         info = dict(self._device)

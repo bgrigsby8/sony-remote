@@ -164,6 +164,9 @@ class PropertyValue:
     value: Any
     choices: List[Any] = field(default_factory=list)
     writable: bool = True
+    # True when `choices` is a {min, max, step} range rather than the list of
+    # allowed values (zoom_distance, zoom_speed_range).
+    range: bool = False
 
 
 class CameraBinding(ABC):
@@ -264,6 +267,11 @@ class CameraBinding(ABC):
         including on timeout - a body left holding S1 stops accepting most
         other commands.
         """
+
+    def set_property_raw(self, name: str, value: int, value_type: int) -> None:
+        """Diagnostic: write `value` with an explicit CrDataType, bypassing the
+        implementation's encoding rules. Bring-up only."""
+        raise UnsupportedValueError("raw property writes are not supported by this binding")
 
     def dump_properties(self) -> List[Dict[str, Any]]:
         """Diagnostic: the body's whole property table, raw.

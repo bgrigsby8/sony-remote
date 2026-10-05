@@ -76,6 +76,9 @@ _DEFAULTS: Dict[str, Any] = {
     "emulated_step_size": 3,
     "emulated_travel_nudges": 150,
     "emulated_nudge_interval_s": 0.2,
+    "zoom_tolerance_mm": 0.0,
+    "zoom_timeout_s": 20.0,
+    "zoom_max_drive_s": 10.0,
 }
 
 _POSITIVE_NUMBERS = (
@@ -83,6 +86,8 @@ _POSITIVE_NUMBERS = (
     "connect_timeout_s",
     "capture_timeout_s",
     "autofocus_timeout_s",
+    "zoom_timeout_s",
+    "zoom_max_drive_s",
 )
 
 
@@ -178,6 +183,16 @@ class Camera(CameraBase, EasyResource):
             not _is_number(focus_on_connect) or focus_on_connect < 0
         ):
             raise ValueError("`focus_on_connect` must be a non-negative number")
+        zoom_tolerance = attrs.get("zoom_tolerance_mm")
+        if zoom_tolerance is not None and (
+            not _is_number(zoom_tolerance) or zoom_tolerance < 0
+        ):
+            raise ValueError("`zoom_tolerance_mm` must be >= 0")
+        zoom_on_connect = attrs.get("zoom_on_connect")
+        if zoom_on_connect is not None and (
+            not _is_number(zoom_on_connect) or zoom_on_connect <= 0
+        ):
+            raise ValueError("`zoom_on_connect` must be a focal length in mm (> 0)")
 
         apply_on_connect = attrs.get("apply_on_connect")
         if apply_on_connect is not None:
@@ -228,6 +243,14 @@ class Camera(CameraBase, EasyResource):
             focus_on_connect=(
                 int(attrs["focus_on_connect"])
                 if attrs.get("focus_on_connect") is not None
+                else None
+            ),
+            zoom_tolerance_mm=float(attr("zoom_tolerance_mm")),
+            zoom_timeout_s=float(attr("zoom_timeout_s")),
+            zoom_max_drive_s=float(attr("zoom_max_drive_s")),
+            zoom_on_connect=(
+                float(attrs["zoom_on_connect"])
+                if attrs.get("zoom_on_connect") is not None
                 else None
             ),
         )

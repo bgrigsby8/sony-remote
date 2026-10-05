@@ -368,3 +368,35 @@ class TestDispatch:
         with pytest.raises(binding.CameraError) as exc:
             await camera.do_command({"capture": {}})
         assert str(exc.value).startswith("[disconnected]")
+
+
+class TestZoomDispatch:
+    async def test_zoom_commands_round_trip(self, camera):
+        info = await camera.do_command({"get_zoom": {}})
+        assert info["min_mm"] == 16.0 and info["max_mm"] == 35.0
+        result = await camera.do_command({"set_zoom": {"focal_length_mm": 24}})
+        assert result["ok"] is True and result["focal_length_mm"] == 24.0
+        named = await camera.do_command({"command": "set_zoom", "mm": 30})
+        assert named["focal_length_mm"] == 30.0
+        drive = await camera.do_command({"zoom_drive": {"speed": -3, "duration_s": 0.1}})
+        assert drive["driving"] is False
+        await camera.do_command({"zoom_drive": {"speed": 1}})
+        stopped = await camera.do_command({"zoom_stop": {}})
+        assert stopped["driving"] is False
+        await camera.do_command({"zoom_preset_save": {"slot": 1}})
+        loaded = await camera.do_command({"zoom_preset_load": {"slot": 1}})
+        assert loaded["slot"] == 1
+
+    async def test_zoom_commands_validate(self, camera):
+        for bad in ({"set_zoom": {}}, {"set_zoom": {"focal_length_mm": -1}},
+                    {"zoom_drive": {"speed": 1.5}}, {"zoom_drive": {}},
+                    {"zoom_drive": {"speed": 1, "duration_s": -1}},
+                    {"zoom_preset_save": {"slot": 256}}, {"zoom_preset_load": {}}):
+            with pytest.raises(Exception):
+                await camera.do_command(bad)
+
+    async def test_set_property_raw_is_unsupported_on_the_fake(self, camera):
+        with pytest.raises(Exception):
+            await camera.do_command(
+                {"set_property_raw": {"name": "zoom_operation", "value": -1, "value_type": "0x2002"}}
+            )

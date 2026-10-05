@@ -22,12 +22,14 @@ the source camera, and is a drop-in for
 | **Stream** | `get_images` returns a live-view JPEG for the operator UI preview, throttled to `live_view_max_fps`. |
 | **Capture** | `{"capture": {}}` fires the shutter and returns once the full-resolution RAW is **on the host's disk** — the SDK saves direct-to-host, so there is no download step and nothing is left on the card. |
 | **Focus** | `get_focus_position` / `set_focus_position` in the SDK's raw units, with read-back and a retry. `autofocus_once` is for calibration only. |
+| **Zoom** | With a power-zoom (PZ) lens: closed-loop absolute zoom in millimetres (`set_zoom`), a speed-controlled drive for jogging (`zoom_drive`), and the body's own zoom+focus presets. |
 | **Exposure** | Aperture, shutter speed, ISO, shutter type, white balance and file format, in machine config (`apply_on_connect`) or at runtime (`set_settings`). |
 | **Survives** | USB drops, camera power cycles and viam-server restarts, with no operator intervention and no camera power cycle. |
 
 What it deliberately does *not* do: RAW development and colour correction (that's
 `color-correction`), sweep orchestration and per-station focus tables (that's
-`nines-webapp`), zoom (fixed prime), video, wireless, or Windows.
+`nines-webapp`), video, wireless, or Windows. Zoom needs a power-zoom lens; with
+a prime the zoom commands report the drive as unavailable.
 
 ## Quick start
 
@@ -288,5 +290,11 @@ Known limitations:
   autofocus, manual nudges and reconnects invalidate the count and the next
   focus operation re-homes. See `focus_emulation` and friends in the
   [model reference](brad-grigsby_sony-remote_camera.md).
+- **Zoom is closed-loop, not commanded.** `ZoomPositionSetting` is refused
+  too, but with a power-zoom lens (verified: FE PZ 16-35mm F4 G) the
+  continuous zoom drive works and the focal length reads back, so `set_zoom`
+  lands exactly on reportable positions (0.5mm apart on that lens). The
+  body's zoom+focus presets via `ZoomAndFocusPosition_Save/Load` also work
+  with that lens.
 - **`linux/amd64` artifacts only** until an ARM build host or CI pipeline is
   set up. The test suite and `"binding": "fake"` work anywhere Python does.
