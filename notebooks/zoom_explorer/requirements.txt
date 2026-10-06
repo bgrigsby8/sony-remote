@@ -1,0 +1,3 @@
+viam-sdk==0.80.0
+matplotlib
+jupyterlab

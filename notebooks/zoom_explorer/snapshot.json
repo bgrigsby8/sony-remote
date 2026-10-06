@@ -1,0 +1,44 @@
+{
+  "_about": "Real readings from Nines-Photographer (ILCE-7RM5 + FE PZ 16-35mm F4 G), captured by Claude Code via the Viam MCP. dump_properties is trimmed to the zoom-related codes; nothing here is synthesized.",
+  "today": {
+    "captured_at": "2026-10-06T13:55Z",
+    "module": "sony-remote feat/power-zoom test build",
+    "get_zoom": {"bar": {"box": 0, "boxes": 1, "position_pct": 100}, "drive_available": true, "driving": false, "focal_length_mm": 35, "max_mm": 35, "min_mm": 16, "scale": 1, "speed_range": [-8, 8], "step_mm": 0.1, "units": "mm", "zoom_type": "optical"},
+    "dump_properties": [
+      {"code": "0x124", "enable": "0x1", "value": "0x3E8", "value_type": "0x4003"},
+      {"code": "0x125", "enable": "0x2", "value": "0x1", "value_type": "0x2001"},
+      {"code": "0x126", "enable": "0x3", "value": "0x0", "value_type": "0x1001"},
+      {"code": "0x134", "enable": "0x1", "value": "0x0", "value_type": "0x2001"},
+      {"code": "0x135", "enable": "0x1", "value": "0x0", "value_type": "0x2001"},
+      {"code": "0x14D", "enable": "0x2", "value": "0x88B8", "value_type": "0x4003"},
+      {"code": "0x50C", "enable": "0x1", "value": "0x1", "value_type": "0x2001"},
+      {"code": "0x71E", "enable": "0x2", "value": "0x1", "value_type": "0x2001"},
+      {"code": "0x71F", "enable": "0x2", "value": "0x1000064", "value_type": "0x3"},
+      {"code": "0x720", "enable": "0x2", "value": "0x1", "value_type": "0x2001"},
+      {"code": "0x724", "enable": "0x2", "value": "0x0", "value_type": "0x5001"},
+      {"code": "0x765", "enable": "0x2", "value": "0x0", "value_type": "0xFFFF"}
+    ]
+  },
+  "baseline_before_zoom_code": {
+    "captured_at": "2026-10-05T17:4xZ",
+    "module": "registry sony-remote 0.1.8 (no zoom support at all)",
+    "dump_properties": [
+      {"code": "0x124", "enable": "0x1", "value": "0x3E8", "value_type": "0x4003"},
+      {"code": "0x125", "enable": "0x2", "value": "0x1", "value_type": "0x2001"},
+      {"code": "0x126", "enable": "0x3", "value": "0x0", "value_type": "0x1001"},
+      {"code": "0x134", "enable": "0x1", "value": "0x0", "value_type": "0x2001"},
+      {"code": "0x135", "enable": "0x0", "value": "0x0", "value_type": "0x2001"},
+      {"code": "0x14D", "enable": "0x2", "value": "0x3E80", "value_type": "0x4003"},
+      {"code": "0x50C", "enable": "0x1", "value": "0x1", "value_type": "0x2001"},
+      {"code": "0x71E", "enable": "0x2", "value": "0x1", "value_type": "0x2001"},
+      {"code": "0x71F", "enable": "0x2", "value": "0x1000000", "value_type": "0x3"},
+      {"code": "0x720", "enable": "0x2", "value": "0x1", "value_type": "0x2001"},
+      {"code": "0x724", "enable": "0x2", "value": "0x0", "value_type": "0x5001"},
+      {"code": "0x765", "enable": "0x2", "value": "0x0", "value_type": "0xFFFF"}
+    ]
+  },
+  "bar_vs_focal_length": {
+    "_about": "Each pair is one get_zoom answer (focal length from 0x14D, bar from 0x71F) observed on 2026-10-05/06.",
+    "pairs": [[16.0, 0], [17.0, 5], [21.5, 28], [24.0, 42], [35.0, 100]]
+  }
+}
