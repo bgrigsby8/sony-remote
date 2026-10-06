@@ -159,6 +159,7 @@ class NativeCamera(CameraBinding):
             value=raw.get("value"),
             choices=list(raw.get("choices") or []),
             writable=bool(raw.get("writable", True)),
+            range=bool(raw.get("range", False)),
         )
 
     def set_property(self, name: str, value: Any) -> None:
@@ -175,6 +176,9 @@ class NativeCamera(CameraBinding):
 
     def autofocus_once(self, timeout_s: float) -> bool:
         return bool(self._call("autofocus_once", int(timeout_s * 1000)))
+
+    def set_property_raw(self, name: str, value: int, value_type: int) -> None:
+        self._call("set_property_raw", name, int(value), int(value_type))
 
     def dump_properties(self) -> List[Dict[str, Any]]:
         return [dict(p) for p in self._call("dump_properties")]

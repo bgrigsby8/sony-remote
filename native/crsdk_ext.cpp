@@ -96,6 +96,42 @@ static const std::map<std::string, cr::CrDevicePropertyCode> kPropertyCodes = {
     // with every lens and mode we could throw at it). Python masks negatives
     // to 16-bit two's complement before the write.
     {"near_far", cr::CrDeviceProperty_NearFar},
+    // The lens's real focus position, 0xFFFF (near stop) .. 0 (far stop).
+    // The ILCE-7RM5 publishes it only in movie mode - in stills it freezes at
+    // its last movie-mode value - and only while `lens_info_enable` reads 1.
+    // The read-back behind `focus_method: movie` in session.py.
+    {"follow_focus_position", cr::CrDeviceProperty_FollowFocusPositionCurrentValue},
+    {"lens_info_enable", cr::CrDeviceProperty_LensInformationEnableStatus},
+    // Power zoom. `zoom_operation` is a continuous drive, not a step: write a
+    // signed speed (positive = tele, negative = wide, range from
+    // `zoom_speed_range`) and the lens keeps moving until 0 is written. The
+    // body only honours it while `zoom_operation_status` is Enable, which
+    // needs a power-zoom lens. ZoomPositionSetting is refused over USB just
+    // like FocusPositionSetting, but `zoom_distance` - the focal length in
+    // 0.001mm, min/max as a range - is readable, which is what closed-loop
+    // absolute zoom in session.py is built on.
+    {"zoom_operation", cr::CrDeviceProperty_Zoom_Operation},
+    {"zoom_operation_status", cr::CrDeviceProperty_Zoom_Operation_Status},
+    {"zoom_speed_range", cr::CrDeviceProperty_Zoom_Speed_Range},
+    {"zoom_speed_type", cr::CrDeviceProperty_Remocon_Zoom_Speed_Type},
+    {"zoom_distance", cr::CrDeviceProperty_ZoomDistance},
+    {"zoom_scale", cr::CrDeviceProperty_Zoom_Scale},
+    {"zoom_bar", cr::CrDeviceProperty_Zoom_Bar_Information},
+    {"zoom_setting", cr::CrDeviceProperty_Zoom_Setting},
+    {"zoom_type_status", cr::CrDeviceProperty_Zoom_Type_Status},
+    // Body-stored zoom+focus presets (survive camera init). Write a slot
+    // number to save the current zoom and focus there / to drive back to it.
+    {"zoom_focus_preset_save", cr::CrDeviceProperty_ZoomAndFocusPosition_Save},
+    {"zoom_focus_preset_load", cr::CrDeviceProperty_ZoomAndFocusPosition_Load},
+};
+
+// Declared write types that override what the body reports; see
+// ext_set_property.
+static const std::map<std::string, cr::CrDataType> kForcedValueTypes = {
+    {"zoom_operation", cr::CrDataType_UInt16Array},
+    // Reported as UInt32Array; Sony's RemoteCli writes UInt16Array, and that
+    // is what the ILCE-7RM5 was seen to honour for the stills<->movie switch.
+    {"exposure_program_mode", cr::CrDataType_UInt16Array},
 };
 
 // Symbolic value <-> SDK enum, for the properties whose values are enums rather
@@ -364,6 +400,31 @@ static std::string enum_name_for(const std::map<std::string, uint64_t>& table, u
     return std::string();
 }
 
+// Signed property types: values travel as sign-extended uint64 and are handed
+// to Python as negative ints. `width_bits` is the element width (0 = unsigned).
+static int signed_width_bits(cr::CrDataType type) {
+    const auto t = static_cast<CrInt32u>(type);
+    if ((t & cr::CrDataType_SignBit) == 0) return 0;
+    switch (t & 0x0F) {
+        case cr::CrDataType_UInt8: return 8;
+        case cr::CrDataType_UInt16: return 16;
+        case cr::CrDataType_UInt32: return 32;
+        default: return 64;
+    }
+}
+
+static int64_t sign_extend(uint64_t raw, int width_bits) {
+    if (width_bits <= 0 || width_bits >= 64) return static_cast<int64_t>(raw);
+    const uint64_t mask = (uint64_t{1} << width_bits) - 1;
+    const uint64_t sign = uint64_t{1} << (width_bits - 1);
+    raw &= mask;
+    return static_cast<int64_t>((raw ^ sign) - sign);
+}
+
+static py::object to_py(uint64_t raw, int width_bits) {
+    return width_bits ? py::cast(sign_extend(raw, width_bits)) : py::cast(raw);
+}
+
 // Decode the property's raw "possible values" buffer. The SDK hands back a byte
 // blob whose element width depends on the declared value type; getting this
 // wrong silently produces garbage choices, which is why every branch is
@@ -374,6 +435,40 @@ static std::vector<uint64_t> decode_values(const cr::CrDeviceProperty& prop) {
     void* buf = prop.GetValues();
     if (buf == nullptr || size == 0) {
         return out;
+    }
+    // A Range type's buffer is {min, max, step} in the element width, so it
+    // decodes exactly like the array; signed widths are sign-extended to 64
+    // bits here and reinterpreted as signed in `to_py`.
+    const auto type = static_cast<CrInt32u>(prop.GetValueType());
+    const auto element = type & ~static_cast<CrInt32u>(cr::CrDataType_RangeBit |
+                                                        cr::CrDataType_ArrayBit);
+    switch (element) {
+        case cr::CrDataType_Int8: {
+            // CrInt8 is plain `char`, which is unsigned on arm64.
+            auto* p = static_cast<const signed char*>(buf);
+            for (CrInt32u i = 0; i < size; ++i)
+                out.push_back(static_cast<uint64_t>(static_cast<int64_t>(p[i])));
+            return out;
+        }
+        case cr::CrDataType_Int16: {
+            auto* p = static_cast<CrInt16*>(buf);
+            for (CrInt32u i = 0; i < size / sizeof(CrInt16); ++i)
+                out.push_back(static_cast<uint64_t>(static_cast<int64_t>(p[i])));
+            return out;
+        }
+        case cr::CrDataType_Int32: {
+            auto* p = static_cast<CrInt32*>(buf);
+            for (CrInt32u i = 0; i < size / sizeof(CrInt32); ++i)
+                out.push_back(static_cast<uint64_t>(static_cast<int64_t>(p[i])));
+            return out;
+        }
+        case cr::CrDataType_UInt32: {
+            auto* p = static_cast<CrInt32u*>(buf);
+            for (CrInt32u i = 0; i < size / sizeof(CrInt32u); ++i) out.push_back(p[i]);
+            return out;
+        }
+        default:
+            break;
     }
     switch (prop.GetValueType()) {
         case cr::CrDataType_UInt8Array:
@@ -594,9 +689,16 @@ static py::dict ext_get_property(const std::string& name) {
             }
             out["choices"] = choices;
         } else {
-            out["value"] = current;
-            out["choices"] = py::cast(values);
+            const int width = signed_width_bits(props[i].GetValueType());
+            out["value"] = to_py(current, width);
+            py::list choices;
+            for (uint64_t v : values) choices.append(to_py(v, width));
+            out["choices"] = choices;
         }
+        // Range types report {min, max, step} as their choices, not a list of
+        // allowed values; say so, or Python treats them as an enumeration.
+        out["range"] = (static_cast<CrInt32u>(props[i].GetValueType()) &
+                        cr::CrDataType_RangeBit) != 0;
         // GetPropertyEnableFlag() distinguishes "readable" from "settable right
         // now" - focus_position is read-only while the lens is in AF, which is
         // exactly the case set_focus_position has to detect and correct.
@@ -612,6 +714,9 @@ static py::dict ext_get_property(const std::string& name) {
     }
     return out;
 }
+
+static void write_property(const std::string& name, cr::CrDevicePropertyCode code,
+                           uint64_t raw, cr::CrDataType value_type);
 
 static void ext_set_property(const std::string& name, py::object value) {
     require_connected();
@@ -635,7 +740,11 @@ static void ext_set_property(const std::string& name, py::object value) {
         }
         raw = it->second;
     } else {
-        raw = value.cast<uint64_t>();
+        // Negative ints are signed properties (zoom_operation's wide drive),
+        // passed sign-extended to 64 bits as Sony's sample does.
+        auto as_int = value.cast<py::int_>();
+        raw = (as_int < py::int_(0)) ? static_cast<uint64_t>(as_int.cast<int64_t>())
+                                    : as_int.cast<uint64_t>();
     }
 
     // The body rejects a set whose declared value type doesn't match the
@@ -667,6 +776,20 @@ static void ext_set_property(const std::string& name, py::object value) {
     // sample sets PriorityKeySettings as UInt32Array even though the enum is
     // 16-bit, so demoting arrays to scalars is exactly the wrong move.
 
+    // Properties Sony's own sample writes with a declared type other than the
+    // one the body reports. Zoom_Operation is the case that matters: declared
+    // as the reported Int8, positive speeds drive but negative ones (wide) are
+    // accepted and silently ignored; RemoteCli declares UInt16Array and passes
+    // the speed sign-extended to 64 bits, and so do we.
+    auto forced = kForcedValueTypes.find(name);
+    if (forced != kForcedValueTypes.end()) {
+        value_type = forced->second;
+    }
+    return write_property(name, code, raw, value_type);
+}
+
+static void write_property(const std::string& name, cr::CrDevicePropertyCode code,
+                           uint64_t raw, cr::CrDataType value_type) {
     cr::CrDeviceProperty prop;
     prop.SetCode(code);
     prop.SetCurrentValue(raw);
@@ -678,6 +801,17 @@ static void ext_set_property(const std::string& name, py::object value) {
         err = cr::SetDeviceProperty(g_handle, &prop);
     }
     check(err, "SetDeviceProperty(" + name + ")");
+}
+
+// Diagnostic: write a property with an explicit value and declared type,
+// bypassing every rule above. For bring-up questions of the form "which
+// encoding does this body actually honour" without a rebuild per guess.
+static void ext_set_property_raw(const std::string& name, py::object value, int value_type) {
+    require_connected();
+    auto as_int = value.cast<py::int_>();
+    uint64_t raw = (as_int < py::int_(0)) ? static_cast<uint64_t>(as_int.cast<int64_t>())
+                                         : as_int.cast<uint64_t>();
+    write_property(name, code_for(name), raw, static_cast<cr::CrDataType>(value_type));
 }
 
 static py::object ext_live_view_jpeg() {
@@ -874,6 +1008,8 @@ PYBIND11_MODULE(_crsdk, m) {
           py::arg("start_no"));
     m.def("get_property", &ext_get_property, py::arg("name"));
     m.def("set_property", &ext_set_property, py::arg("name"), py::arg("value"));
+    m.def("set_property_raw", &ext_set_property_raw, py::arg("name"), py::arg("value"),
+          py::arg("value_type"));
     m.def("live_view_jpeg", &ext_live_view_jpeg);
     m.def("trigger_capture", &ext_trigger_capture);
     m.def("autofocus_once", &ext_autofocus_once, py::arg("timeout_ms"));

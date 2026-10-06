@@ -60,11 +60,18 @@ _FLAT = (
     "autofocus_once",
     "focus_near_far",
     "home_focus",
+    "get_zoom",
+    "set_zoom",
+    "zoom_drive",
+    "zoom_stop",
+    "zoom_preset_save",
+    "zoom_preset_load",
     "get_settings",
     "set_settings",
     "get_status",
     "capture_count",
     "dump_properties",
+    "set_property_raw",
 )
 
 ALL_COMMANDS = _NESTED + _FLAT
@@ -269,9 +276,49 @@ class CommandHandler:
         """Re-zero emulated focus against the lens's near stop.
 
         Sweep orchestration calls this at sweep start so per-station positions
-        stay honest. Informational no-op on bodies with native absolute focus.
+        stay honest. Under `focus_method: movie` it reads the real position
+        instead of moving the lens. Informational no-op on bodies with native
+        absolute focus.
         """
         return await _to_thread(self._session.home_focus)
+
+    async def _cmd_get_zoom(self, opts: Mapping[str, Any]) -> Dict[str, ValueTypes]:
+        """Focal length (mm), lens range, drive speed range and zoom bar."""
+        return await _to_thread(self._session.get_zoom)
+
+    async def _cmd_set_zoom(self, opts: Mapping[str, Any]) -> Dict[str, ValueTypes]:
+        """Closed-loop absolute zoom to `focal_length_mm` (alias `mm`),
+        within `tolerance_mm`. Answers `ok: false` with where it stopped
+        rather than raising when it can't get inside the tolerance."""
+        target = opts.get("focal_length_mm", opts.get("mm"))
+        if isinstance(target, bool) or not isinstance(target, (int, float)) or target <= 0:
+            raise ValueError("`set_zoom` needs `focal_length_mm` (a number > 0)")
+        tolerance = _optional_number(opts.get("tolerance_mm"))
+        return await _to_thread(self._session.set_zoom, float(target), tolerance)
+
+    async def _cmd_zoom_drive(self, opts: Mapping[str, Any]) -> Dict[str, ValueTypes]:
+        """Run the power zoom: `speed` > 0 tele, < 0 wide (range from
+        `get_zoom.speed_range`). With `duration_s` it moves for that long and
+        stops; without, it runs until `zoom_stop`, another drive, or the
+        `zoom_max_drive_s` watchdog - for press-and-hold jog buttons."""
+        speed = opts.get("speed")
+        if isinstance(speed, bool) or not isinstance(speed, (int, float)) or int(speed) != speed:
+            raise ValueError("`zoom_drive` needs an integer `speed` (+ tele, - wide, 0 stop)")
+        duration = _optional_number(opts.get("duration_s"))
+        if duration is not None and duration < 0:
+            raise ValueError("`duration_s` must be >= 0")
+        return await _to_thread(self._session.zoom_drive, int(speed), duration)
+
+    async def _cmd_zoom_stop(self, opts: Mapping[str, Any]) -> Dict[str, ValueTypes]:
+        return await _to_thread(self._session.zoom_drive, 0)
+
+    async def _cmd_zoom_preset_save(self, opts: Mapping[str, Any]) -> Dict[str, ValueTypes]:
+        """Store the current zoom AND focus in the body's preset `slot`."""
+        return await _to_thread(self._session.zoom_preset, "save", _slot(opts))
+
+    async def _cmd_zoom_preset_load(self, opts: Mapping[str, Any]) -> Dict[str, ValueTypes]:
+        """Drive zoom and focus back to the body's preset `slot`."""
+        return await _to_thread(self._session.zoom_preset, "load", _slot(opts))
 
     async def _cmd_get_settings(self, opts: Mapping[str, Any]) -> Dict[str, ValueTypes]:
         return await _to_thread(self._session.get_settings)
@@ -289,6 +336,17 @@ class CommandHandler:
 
     async def _cmd_get_status(self, opts: Mapping[str, Any]) -> Dict[str, ValueTypes]:
         return await _to_thread(self._session.device_status)
+
+    async def _cmd_set_property_raw(self, opts: Mapping[str, Any]) -> Dict[str, ValueTypes]:
+        """Diagnostic: write a property with an explicit value and CrDataType
+        (`value_type`, int or hex string such as "0x2002"). Bypasses every
+        encoding rule; for working out what a body honours during bring-up."""
+        name = opts.get("name")
+        if not isinstance(name, str) or not name:
+            raise ValueError("`set_property_raw` needs a property `name`")
+        value = _int_or_hex(opts.get("value"), "value")
+        value_type = _int_or_hex(opts.get("value_type"), "value_type")
+        return await _to_thread(self._session.set_property_raw, name, value, value_type)
 
     async def _cmd_dump_properties(self, opts: Mapping[str, Any]) -> Dict[str, ValueTypes]:
         """Diagnostic: the body's whole property table, hex-formatted.
@@ -385,3 +443,23 @@ async def _to_thread(fn, *args):
     length of a capture.
     """
     return await asyncio.to_thread(fn, *args)
+
+
+def _slot(opts: Mapping[str, Any]) -> int:
+    slot = opts.get("slot")
+    if isinstance(slot, bool) or not isinstance(slot, (int, float)) or int(slot) != slot:
+        raise ValueError("needs an integer preset `slot` (0..255)")
+    if not 0 <= int(slot) <= 255:
+        raise ValueError(f"`slot` must be 0..255, got {slot}")
+    return int(slot)
+
+
+def _int_or_hex(value: Any, key: str) -> int:
+    if isinstance(value, str):
+        try:
+            return int(value, 0)
+        except ValueError:
+            pass
+    elif not isinstance(value, bool) and isinstance(value, (int, float)) and int(value) == value:
+        return int(value)
+    raise ValueError(f"`{key}` must be an integer or a hex string, got {value!r}")

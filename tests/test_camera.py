@@ -99,11 +99,26 @@ class TestValidateConfig:
             ({"focus_tolerance": -1}, "focus_tolerance"),
             ({"binding": "usb"}, "binding"),
             ({"apply_on_connect": "f/11"}, "apply_on_connect"),
+            ({"focus_method": "follow"}, "focus_method"),
+            ({"focus_method": "movie", "movie_focus_fallback": "af"}, "movie_focus_fallback"),
+            ({"movie_focus_tolerance": -1}, "movie_focus_tolerance"),
+            ({"movie_mode_timeout_s": 0}, "movie_mode_timeout_s"),
+            ({"movie_units_per_nudge": 0}, "movie_units_per_nudge"),
+            ({"movie_max_nudges": 0}, "movie_max_nudges"),
+            ({"focus_method": "nudge", "focus_emulation": "off"}, "focus_emulation"),
+            # The default fallback is the emulation that "off" forbids.
+            ({"focus_method": "movie", "focus_emulation": "off"}, "movie_focus_fallback"),
         ],
     )
     def test_rejects_bad_attributes(self, attributes, fragment):
         with pytest.raises(ValueError, match=fragment):
             Camera.validate_config(make_config(**attributes))
+
+    def test_movie_focus_without_the_emulation_is_valid_with_no_fallback(self):
+        config = make_config(
+            focus_method="movie", focus_emulation="off", movie_focus_fallback="none"
+        )
+        assert Camera.validate_config(config) == ([], [])
 
     def test_a_mistyped_setting_is_caught_at_config_time(self):
         # Not at capture time, hours later, in a shot nobody looks at until
@@ -370,3 +385,35 @@ class TestDispatch:
         with pytest.raises(binding.CameraError) as exc:
             await camera.do_command({"capture": {}})
         assert str(exc.value).startswith("[disconnected]")
+
+
+class TestZoomDispatch:
+    async def test_zoom_commands_round_trip(self, camera):
+        info = await camera.do_command({"get_zoom": {}})
+        assert info["min_mm"] == 16.0 and info["max_mm"] == 35.0
+        result = await camera.do_command({"set_zoom": {"focal_length_mm": 24}})
+        assert result["ok"] is True and result["focal_length_mm"] == 24.0
+        named = await camera.do_command({"command": "set_zoom", "mm": 30})
+        assert named["focal_length_mm"] == 30.0
+        drive = await camera.do_command({"zoom_drive": {"speed": -3, "duration_s": 0.1}})
+        assert drive["driving"] is False
+        await camera.do_command({"zoom_drive": {"speed": 1}})
+        stopped = await camera.do_command({"zoom_stop": {}})
+        assert stopped["driving"] is False
+        await camera.do_command({"zoom_preset_save": {"slot": 1}})
+        loaded = await camera.do_command({"zoom_preset_load": {"slot": 1}})
+        assert loaded["slot"] == 1
+
+    async def test_zoom_commands_validate(self, camera):
+        for bad in ({"set_zoom": {}}, {"set_zoom": {"focal_length_mm": -1}},
+                    {"zoom_drive": {"speed": 1.5}}, {"zoom_drive": {}},
+                    {"zoom_drive": {"speed": 1, "duration_s": -1}},
+                    {"zoom_preset_save": {"slot": 256}}, {"zoom_preset_load": {}}):
+            with pytest.raises(Exception):
+                await camera.do_command(bad)
+
+    async def test_set_property_raw_is_unsupported_on_the_fake(self, camera):
+        with pytest.raises(Exception):
+            await camera.do_command(
+                {"set_property_raw": {"name": "zoom_operation", "value": -1, "value_type": "0x2002"}}
+            )

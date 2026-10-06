@@ -56,6 +56,12 @@ Every attribute is optional.
 | `emulated_travel_nudges` | number | `150` | Homing budget and position ceiling: this many nudges must cross the lens's full travel with margin. Calibrate per lens with `focus_near_far`. |
 | `emulated_nudge_interval_s` | number | `0.03` | Pause after each nudge, letting the drive settle. |
 | `focus_on_connect` | number | — | Drive focus to this position on every connect, including reconnects after a camera power cycle (which can physically move a power-zoom lens). With emulated focus this homes first. For a rig whose stations share one focus plane, this single number replaces all other focus handling; a failure is recorded in `apply_errors`, never fatal. |
+| `focus_method` | string | `"auto"` | `"auto"`: the body's own absolute focus if it reports one, else the near/far emulation (the behaviour before this attribute existed). `"movie"`: closed loop on the lens's real position, read from the movie-mode follow-focus channel — see [Movie-mode focus](#movie-mode-focus). `"nudge"`: always the emulation. |
+| `movie_focus_fallback` | string | `"nudge"` | What `"movie"` does when movie mode can't run (no follow-focus channel, a mode switch that won't take): `"nudge"` switches to the emulation until the next connect or `home_focus`, keeping positions in follow-focus units; `"none"` fails the focus command. `"nudge"` is invalid with `focus_emulation: "off"`. |
+| `movie_focus_tolerance` | number | `400` | How close, in follow-focus units (0–65535), the read-back must land. One size-1 nudge is ~700 units on the FE PZ 16-35, so much tighter than half that can hunt. Overridable per call. |
+| `movie_mode_timeout_s` | number | `5` | Longest wait for a stills↔movie switch, and for the lens to start publishing its position. |
+| `movie_units_per_nudge` | number | `2100` | Follow-focus units per nudge of `emulated_step_size`: sizes each closed-loop nudge, and converts positions under the fallback. ~2100 measured for step 3 on the FE PZ 16-35. |
+| `movie_max_nudges` | number | `60` | Nudge budget for one closed-loop move before it reports `ok: false`. |
 
 `apply_on_connect` values are validated all the way down to their raw SDK
 encoding when the machine config is saved, so a mistyped aperture is a config
@@ -82,6 +88,10 @@ only deletes files this module itself wrote. Those guards are the safety net,
 not the design: a directory shared with another writer means a warning on every
 ambiguous shot and a directory that fills with files nobody prunes. Give each
 writer its own directory.
+| `zoom_tolerance_mm` | number | `0` | How far a `set_zoom` read-back may be from the target and still count as landed. `0` means exactly on a reportable position, which the closed loop reaches in 1-3 passes on the FE PZ 16-35. |
+| `zoom_timeout_s` | number | `20` | Ceiling on one `set_zoom` (or `zoom_on_connect`). |
+| `zoom_max_drive_s` | number | `10` | Watchdog for an open-ended `zoom_drive` (no `duration_s`): the lens is stopped this long after the last drive command if nothing stops it first. |
+| `zoom_on_connect` | number | — | Drive zoom to this focal length (mm) on every connect, before `focus_on_connect` (zooming can move a PZ lens's focus group). A failure is recorded in `apply_errors`, never fatal. |
 
 ### Settings vocabulary
 
@@ -175,6 +185,44 @@ into the near stop and calls that zero, which takes
 `emulated_travel_nudges × emulated_nudge_interval_s` seconds. Calibration works
 exactly as before: store the integer, play it back.
 
+With `focus_method: "movie"`, `units` is `"follow_focus"` and the position is
+**read from the lens**, not counted: 0 at the near stop, 65535 at the far stop.
+Each read costs two mode switches (about 4s on the A7R V); see
+[Movie-mode focus](#movie-mode-focus).
+
+### Movie-mode focus
+
+The ILCE-7RM5 does report where its lens is focused — `FollowFocusPositionCurrentValue`
+— but **only in movie mode**. In stills mode the value freezes at whatever it
+read last in movie mode. With `focus_method: "movie"` every focus command:
+
+1. switches the body to the movie counterpart of its stills mode (M → Movie M,
+   P → Movie P, …) and waits until the lens publishes its position;
+2. reads it, and for `set_focus_position` nudges near/far in a closed loop until
+   the read-back is within `movie_focus_tolerance` (nudge size follows the
+   remaining distance; an overshoot steps the size down);
+3. switches back to the stills mode it found.
+
+Nothing is counted, so nothing homes, drifts, or needs re-homing after
+autofocus, zoom or a reconnect: a hand on the focus ring shows up in the next
+read. The cost is the round trip, about 4s per command on the A7R V.
+
+Safety nets: a body found in movie mode at connect (a focus command
+interrupted mid-way) is switched back to stills, and `capture` refuses to fire
+— with an `[sdk_error]` naming the stills switch — while a failed switch-back
+is outstanding. `get_status` reports `focus_method` (the backend actually in
+use) and `focus_fallback_reason`.
+
+When movie mode fails and `movie_focus_fallback` is `"nudge"`, the command
+completes on the emulation instead, converting positions with
+`movie_units_per_nudge` (results then carry `"method": "nudge_fallback"` and
+`"estimated": true`). `home_focus` retries movie mode.
+
+**The lens's AF/MF switch must be on AF** (set MF on the body). With the lens
+switch on MF the body disables the near/far drive and silently ignores every
+nudge; every command that nudges (movie, the emulation, `focus_near_far`) now
+fails with a `[configuration]` error saying so instead.
+
 ### `set_focus_position`
 
 ```json
@@ -193,6 +241,14 @@ once if the read-back is further than `tolerance` from the target.
 A second miss returns `"ok": false` with the position it did reach, rather than
 retrying forever — whether that's good enough for a given station is the
 caller's call.
+
+Under `focus_method: "movie"`, `attempts` is the number of nudges and `ok` is
+an honest read-back comparison — `false` means the lens really isn't there:
+
+```json
+{"position": 30112, "target": 30000, "tolerance": 400,
+ "attempts": 9, "ok": true, "units": "follow_focus", "method": "movie"}
+```
 
 ### `focus_near_far`
 
@@ -216,6 +272,11 @@ Re-zero emulated focus against the near stop. Sweep orchestration should call
 this at sweep start so per-station positions stay honest; it is otherwise
 called automatically by the first focus operation that needs it. On bodies
 with native absolute focus it reports `{"emulated": false}` and does nothing.
+
+Under `focus_method: "movie"` nothing needs zeroing: it reads the lens's real
+position instead, without moving it, and gives movie mode another chance if an
+earlier command fell back to the emulation —
+`{"emulated": false, "method": "movie", "position": 30112, "units": "follow_focus"}`.
 
 ### `autofocus_once`
 
@@ -261,6 +322,78 @@ Works whether or not a camera is attached — `connected` reflects the truth and
 `last_error` says why not. `model` and `serial` are the last-known values when
 disconnected. `apply_errors` lists any `apply_on_connect` values the camera
 refused.
+
+### Zoom (power-zoom lenses)
+
+The body refuses `ZoomPositionSetting` over USB, as it does focus, but it
+reports the focal length (`ZoomDistance`), so absolute zoom is a closed loop
+over the continuous zoom drive, in real millimetres. Nothing needs homing.
+Any zoom movement invalidates emulated focus, and the next focus operation
+re-homes.
+
+```json
+{"get_zoom": {}}
+```
+```json
+{"focal_length_mm": 24.0, "min_mm": 16.0, "max_mm": 35.0, "step_mm": 0.1,
+ "speed_range": [-8, 8], "drive_available": true, "driving": false,
+ "zoom_type": "optical", "scale": 1.0,
+ "bar": {"boxes": 1, "box": 0, "position_pct": 42}, "units": "mm"}
+```
+
+`drive_available: false` means no power-zoom lens (or the body is busy).
+`step_mm` is what the body advertises. The FE PZ 16-35 actually reads back in
+0.5mm steps.
+
+```json
+{"set_zoom": {"focal_length_mm": 24}}
+{"set_zoom": {"mm": 24, "tolerance_mm": 0.5}}
+```
+```json
+{"focal_length_mm": 24.0, "target_mm": 24.0, "tolerance_mm": 0.0,
+ "passes": 2, "ok": true, "resolution_limited": false, "units": "mm"}
+```
+
+Drives toward the target at a speed scaled to the distance, stops, waits for
+the lens to stop coasting, and corrects at halved speed after each overshoot.
+A target outside the lens is clamped. A target between two reportable
+positions (25.2mm on a lens that reads 25.0/25.5) ends with
+`resolution_limited: true` on the closer one, rather than hunting. Like
+`set_focus_position`, a miss is `ok: false`, not an error.
+
+```json
+{"zoom_drive": {"speed": 3, "duration_s": 0.5}}
+{"zoom_drive": {"speed": -8}}
+{"zoom_stop": {}}
+```
+
+The raw drive: `speed` > 0 is tele and < 0 is wide, magnitude up to
+`speed_range` (clamped). With `duration_s` it moves, stops, and returns the
+settled focal length. Without it the lens keeps moving until `zoom_stop`,
+another drive, or the `zoom_max_drive_s` watchdog. That is the primitive for
+press-and-hold jog buttons. At speed 8 the FE PZ 16-35 crosses its whole
+range in about 1s.
+
+```json
+{"zoom_preset_save": {"slot": 1}}
+{"zoom_preset_load": {"slot": 1}}
+```
+
+The body's own presets (`ZoomAndFocusPosition_Save/Load`) store zoom **and**
+focus in the camera and survive its init. Loading takes up to ~2s to start
+moving, and the answer reports the focal length after the lens settles.
+
+### `set_property_raw` (diagnostic)
+
+```json
+{"set_property_raw": {"name": "zoom_operation", "value": -1, "value_type": "0x2002"}}
+```
+
+Writes a known property with an explicit value and declared `CrDataType`,
+bypassing every encoding rule. This is for bring-up questions like "which
+encoding does this body honour". It is how the zoom drive's wide direction
+was found to need RemoteCli's `UInt16Array` declaration: declared as the
+reported `Int8`, negative speeds are accepted and silently ignored.
 
 ### `capture_count`
 

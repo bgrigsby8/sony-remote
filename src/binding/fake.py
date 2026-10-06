@@ -18,6 +18,11 @@ against, because those are the ones the module exists to handle:
 * **A file is visible before it is complete.** `slow_write_s` writes a short
   prefix, then the rest after a delay, so the "wait for the size to settle"
   path is actually exercised.
+* **Zoom is a motor, not a register.** `zoom_operation` starts a continuous
+  drive that runs until a 0 write, the lens coasts a little after the stop,
+  and the focal length reads back on a coarser grid than the body advertises
+  (the FE PZ 16-35 says 0.1mm, reports 0.5mm) - the three things the
+  closed-loop `set_zoom` has to cope with.
 * **Focus doesn't land where you put it.** `focus_error_sequence` makes the
   first `set_focus_position` miss and the second land, which is the whole
   reason `set_focus_position` reads back and retries.
@@ -88,6 +93,26 @@ _DEFAULT_PROPERTIES: Dict[str, Dict[str, Any]] = {
     # Relative focus drive (signed Int16 on the wire, two's complement).
     # Setting it moves focus_position; see set_property.
     "near_far": {"value": 0, "choices": []},
+    # Raw CrExposureProgram: 0x1 is stills M, 0x8053 Movie M.
+    "exposure_program_mode": {"value": 0x1, "choices": []},
+    # Movie-mode follow focus: 1 while the lens publishes its position (movie
+    # mode only), and that position (0xFFFF near stop .. 0 far stop), live in
+    # movie mode and frozen at its last movie value in stills. Both computed
+    # on read; see get_property.
+    "lens_info_enable": {"value": 0, "choices": []},
+    "follow_focus_position": {"value": 0, "choices": []},
+    # Power zoom, modelled on an FE PZ 16-35mm F4 G. zoom_distance and
+    # zoom_speed_range are Range properties: choices are {min, max, step}.
+    # zoom_distance's value is computed from the drive model on every read.
+    "zoom_distance": {"value": 16000, "choices": [16000, 35000, 100], "range": True},
+    "zoom_speed_range": {"value": 0, "choices": [-8, 8, 1], "range": True},
+    "zoom_operation": {"value": 0, "choices": [-8, 8, 1], "range": True},
+    "zoom_operation_status": {"value": 1, "choices": [0, 1]},
+    "zoom_type_status": {"value": 1, "choices": []},
+    "zoom_scale": {"value": 1000, "choices": []},
+    "zoom_bar": {"value": 0x01000000, "choices": []},
+    "zoom_focus_preset_save": {"value": 0, "choices": []},
+    "zoom_focus_preset_load": {"value": 0, "choices": []},
 }
 
 
@@ -144,6 +169,27 @@ class FakeCamera(CameraBinding):
         # session's emulation layer takes over. The internal focus_position
         # value keeps tracking the physical truth for assertions.
         self.absolute_focus_supported = True
+        # Movie-mode follow focus, modelled on the ILCE-7RM5: switching
+        # `exposure_program_mode` to a movie value makes `follow_focus_position`
+        # track the lens. False -> the lens never publishes it (lens_info_enable
+        # stays 0). `mode_switch_works=False` -> the body accepts mode writes
+        # and ignores them.
+        self.movie_focus_supported = True
+        self.mode_switch_works = True
+        # False models the lens's AF/MF switch on MF: near_far reads as not
+        # writable, and writes are accepted and ignored - the lens never moves.
+        self.near_far_enabled = True
+        self._follow_latched = 0
+        # Zoom drive model: focal length moves `zoom_um_per_s_per_speed` per
+        # second per unit of speed, clamped to the lens's range, keeps moving
+        # for `zoom_coast_s` after a stop, and reads back rounded to
+        # `zoom_report_quantum_um`. `power_zoom=False` models a lens with no
+        # zoom motor (Zoom_Operation_Status Disable, no focal length).
+        self.power_zoom = True
+        self.zoom_um_per_s_per_speed = 2400
+        self.zoom_coast_s = 0.02
+        self.zoom_report_quantum_um = 500
+        self.zoom_presets: Dict[int, int] = {}
         # Extra cameras `enumerate` should report, to test the ambiguity guard.
         self.extra_devices: List[DeviceInfo] = []
 
@@ -166,6 +212,12 @@ class FakeCamera(CameraBinding):
         self._seq = 0
         self._battery = 87
         self._properties = {k: dict(v) for k, v in _DEFAULT_PROPERTIES.items()}
+        # Zoom drive state: true position (um), speed, and when they were set.
+        self._zoom_um = 16000.0
+        self._zoom_speed = 0
+        self._zoom_since = time.monotonic()
+        self._zoom_coast_until = 0.0
+        self._zoom_coast_speed = 0
 
     # ------------------------------------------------------------------
     # Test-side controls
@@ -193,6 +245,46 @@ class FakeCamera(CameraBinding):
     def property_value(self, name: str) -> Any:
         """Peek at a raw property without going through the module."""
         return self._properties[name]["value"]
+
+    def in_movie_mode(self) -> bool:
+        return self._properties["exposure_program_mode"]["value"] >= 0x8050
+
+    def follow_focus_now(self) -> int:
+        """What the body would report as FollowFocusPositionCurrentValue for
+        the lens's physical position: 0xFFFF at the near stop, 0 at far."""
+        span = max(1, self.focus_max - self.focus_min)
+        physical = self._properties["focus_position"]["value"] - self.focus_min
+        return 0xFFFF - int(round(physical * 0xFFFF / span))
+
+    def zoom_true_um(self) -> float:
+        """The simulated lens's exact focal length, for assertions."""
+        self._advance_zoom()
+        return self._zoom_um
+
+    def zoom_is_driving(self) -> bool:
+        return self._zoom_speed != 0
+
+    def _advance_zoom(self) -> None:
+        now = time.monotonic()
+        lo, hi = self._properties["zoom_distance"]["choices"][:2]
+        if self._zoom_speed:
+            moved = self._zoom_speed * self.zoom_um_per_s_per_speed * (now - self._zoom_since)
+        elif self._zoom_coast_until > self._zoom_since:
+            coast_end = min(now, self._zoom_coast_until)
+            moved = self._zoom_coast_speed * self.zoom_um_per_s_per_speed * max(
+                0.0, coast_end - self._zoom_since
+            )
+        else:
+            moved = 0.0
+        self._zoom_um = max(lo, min(hi, self._zoom_um + moved))
+        self._zoom_since = now
+
+    def _set_zoom_speed(self, speed: int) -> None:
+        self._advance_zoom()
+        if speed == 0 and self._zoom_speed:
+            self._zoom_coast_speed = self._zoom_speed
+            self._zoom_coast_until = time.monotonic() + self.zoom_coast_s
+        self._zoom_speed = speed
 
     def cancel_timers(self) -> None:
         for timer in self._timers:
@@ -274,13 +366,36 @@ class FakeCamera(CameraBinding):
         self._require_connected()
         if name == "focus_position" and not self.absolute_focus_supported:
             raise UnsupportedValueError("this body does not report property 'focus_position'")
+        if name.startswith("zoom") and not self.power_zoom and name not in (
+            "zoom_operation_status",
+        ):
+            raise UnsupportedValueError(f"this body does not report property {name!r}")
         prop = self._properties.get(name)
         if prop is None:
             raise UnsupportedValueError(f"this body has no property {name!r}")
+        value = prop["value"]
+        if name == "zoom_distance":
+            self._advance_zoom()
+            quantum = max(1, int(self.zoom_report_quantum_um))
+            value = int(round(self._zoom_um / quantum) * quantum)
+        elif name == "zoom_operation_status" and not self.power_zoom:
+            value = 0
+        elif name == "lens_info_enable":
+            value = 1 if self.movie_focus_supported and self.in_movie_mode() else 0
+        elif name == "follow_focus_position":
+            if not self.movie_focus_supported:
+                raise UnsupportedValueError(f"this body does not report property {name!r}")
+            if self.in_movie_mode():
+                self._follow_latched = self.follow_focus_now()
+            value = self._follow_latched
+        writable = bool(prop.get("writable", True))
+        if name == "near_far":
+            writable = self.near_far_enabled
         return PropertyValue(
-            value=prop["value"],
+            value=value,
             choices=list(prop.get("choices") or []),
-            writable=bool(prop.get("writable", True)),
+            writable=writable,
+            range=bool(prop.get("range", False)),
         )
 
     def set_property(self, name: str, value: Any) -> None:
@@ -295,7 +410,11 @@ class FakeCamera(CameraBinding):
         if prop is None:
             raise UnsupportedValueError(f"this body has no property {name!r}")
         choices = prop.get("choices") or []
-        if choices and value not in choices:
+        if prop.get("range"):
+            lo, hi = choices[0], choices[1]
+            if not lo <= value <= hi:
+                raise UnsupportedValueError(f"{name} out of range: {value!r}", valid=[lo, hi])
+        elif choices and value not in choices:
             raise UnsupportedValueError(
                 f"{name} does not accept {value!r}", valid=choices
             )
@@ -306,6 +425,28 @@ class FakeCamera(CameraBinding):
             # commanded value, not on it.
             error = self.focus_error_sequence.pop(0) if self.focus_error_sequence else 0
             prop["value"] = value + error
+        elif name == "zoom_operation":
+            if not self.power_zoom:
+                raise UnsupportedValueError("zoom operation is not available")
+            self._set_zoom_speed(int(value))
+        elif name == "zoom_focus_preset_save":
+            self._advance_zoom()
+            self.zoom_presets[int(value)] = int(self._zoom_um)
+        elif name == "zoom_focus_preset_load":
+            if int(value) not in self.zoom_presets:
+                raise UnsupportedValueError(f"no zoom/focus preset in slot {value}")
+            self._set_zoom_speed(0)
+            self._zoom_um = float(self.zoom_presets[int(value)])
+            self._zoom_since = time.monotonic()
+        elif name == "exposure_program_mode":
+            if self.mode_switch_works:
+                if self.in_movie_mode() and self.movie_focus_supported:
+                    self._follow_latched = self.follow_focus_now()
+                prop["value"] = value
+        elif name == "near_far" and not self.near_far_enabled:
+            # Accepted and ignored, exactly like the body with the lens's
+            # AF/MF switch on MF.
+            prop["value"] = 0
         elif name == "near_far":
             # Signed Int16 on the wire (two's complement); each write nudges
             # focus by `near_far_units_per_step` per unit of magnitude, clamped
