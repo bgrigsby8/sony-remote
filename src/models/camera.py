@@ -76,13 +76,27 @@ _DEFAULTS: Dict[str, Any] = {
     "emulated_step_size": 3,
     "emulated_travel_nudges": 150,
     "emulated_nudge_interval_s": 0.2,
+    "focus_method": "auto",
+    "movie_focus_fallback": "nudge",
+    "movie_focus_tolerance": 400,
+    "movie_mode_timeout_s": 5.0,
+    "movie_units_per_nudge": 2100.0,
+    "movie_max_nudges": 60,
+    "zoom_tolerance_mm": 0.0,
+    "zoom_timeout_s": 20.0,
+    "zoom_max_drive_s": 10.0,
 }
 
 _POSITIVE_NUMBERS = (
+    "movie_mode_timeout_s",
+    "movie_units_per_nudge",
+    "movie_max_nudges",
     "live_view_max_fps",
     "connect_timeout_s",
     "capture_timeout_s",
     "autofocus_timeout_s",
+    "zoom_timeout_s",
+    "zoom_max_drive_s",
 )
 
 
@@ -178,6 +192,41 @@ class Camera(CameraBase, EasyResource):
             not _is_number(focus_on_connect) or focus_on_connect < 0
         ):
             raise ValueError("`focus_on_connect` must be a non-negative number")
+        focus_method = attrs.get("focus_method")
+        if focus_method is not None and focus_method not in ("auto", "movie", "nudge"):
+            raise ValueError('`focus_method` must be "auto", "movie" or "nudge"')
+        fallback = attrs.get("movie_focus_fallback")
+        if fallback is not None and fallback not in ("nudge", "none"):
+            raise ValueError('`movie_focus_fallback` must be "nudge" or "none"')
+        # `focus_emulation: off` forbids the near/far emulation everywhere, so
+        # asking for it by another name is a contradiction, not a preference.
+        if focus_emulation == "off":
+            if focus_method == "nudge":
+                raise ValueError(
+                    '`focus_method: "nudge"` needs the emulation that '
+                    '`focus_emulation: "off"` disables'
+                )
+            if focus_method == "movie" and (fallback or "nudge") == "nudge":
+                raise ValueError(
+                    '`movie_focus_fallback: "nudge"` (the default) needs the '
+                    'emulation that `focus_emulation: "off"` disables; set '
+                    '`movie_focus_fallback: "none"`'
+                )
+        movie_tolerance = attrs.get("movie_focus_tolerance")
+        if movie_tolerance is not None and (
+            not _is_number(movie_tolerance) or movie_tolerance < 0
+        ):
+            raise ValueError("`movie_focus_tolerance` must be a non-negative number")
+        zoom_tolerance = attrs.get("zoom_tolerance_mm")
+        if zoom_tolerance is not None and (
+            not _is_number(zoom_tolerance) or zoom_tolerance < 0
+        ):
+            raise ValueError("`zoom_tolerance_mm` must be >= 0")
+        zoom_on_connect = attrs.get("zoom_on_connect")
+        if zoom_on_connect is not None and (
+            not _is_number(zoom_on_connect) or zoom_on_connect <= 0
+        ):
+            raise ValueError("`zoom_on_connect` must be a focal length in mm (> 0)")
 
         apply_on_connect = attrs.get("apply_on_connect")
         if apply_on_connect is not None:
@@ -225,9 +274,23 @@ class Camera(CameraBase, EasyResource):
             emulated_step_size=int(attr("emulated_step_size")),
             emulated_travel_nudges=int(attr("emulated_travel_nudges")),
             emulated_nudge_interval_s=float(attr("emulated_nudge_interval_s")),
+            focus_method=str(attr("focus_method")),
+            movie_focus_fallback=str(attr("movie_focus_fallback")),
+            movie_focus_tolerance=int(attr("movie_focus_tolerance")),
+            movie_mode_timeout_s=float(attr("movie_mode_timeout_s")),
+            movie_units_per_nudge=float(attr("movie_units_per_nudge")),
+            movie_max_nudges=int(attr("movie_max_nudges")),
             focus_on_connect=(
                 int(attrs["focus_on_connect"])
                 if attrs.get("focus_on_connect") is not None
+                else None
+            ),
+            zoom_tolerance_mm=float(attr("zoom_tolerance_mm")),
+            zoom_timeout_s=float(attr("zoom_timeout_s")),
+            zoom_max_drive_s=float(attr("zoom_max_drive_s")),
+            zoom_on_connect=(
+                float(attrs["zoom_on_connect"])
+                if attrs.get("zoom_on_connect") is not None
                 else None
             ),
         )
