@@ -96,6 +96,12 @@ static const std::map<std::string, cr::CrDevicePropertyCode> kPropertyCodes = {
     // with every lens and mode we could throw at it). Python masks negatives
     // to 16-bit two's complement before the write.
     {"near_far", cr::CrDeviceProperty_NearFar},
+    // The lens's real focus position, 0xFFFF (near stop) .. 0 (far stop).
+    // The ILCE-7RM5 publishes it only in movie mode - in stills it freezes at
+    // its last movie-mode value - and only while `lens_info_enable` reads 1.
+    // The read-back behind `focus_method: movie` in session.py.
+    {"follow_focus_position", cr::CrDeviceProperty_FollowFocusPositionCurrentValue},
+    {"lens_info_enable", cr::CrDeviceProperty_LensInformationEnableStatus},
     // Power zoom. `zoom_operation` is a continuous drive, not a step: write a
     // signed speed (positive = tele, negative = wide, range from
     // `zoom_speed_range`) and the lens keeps moving until 0 is written. The
@@ -123,6 +129,9 @@ static const std::map<std::string, cr::CrDevicePropertyCode> kPropertyCodes = {
 // ext_set_property.
 static const std::map<std::string, cr::CrDataType> kForcedValueTypes = {
     {"zoom_operation", cr::CrDataType_UInt16Array},
+    // Reported as UInt32Array; Sony's RemoteCli writes UInt16Array, and that
+    // is what the ILCE-7RM5 was seen to honour for the stills<->movie switch.
+    {"exposure_program_mode", cr::CrDataType_UInt16Array},
 };
 
 // Symbolic value <-> SDK enum, for the properties whose values are enums rather

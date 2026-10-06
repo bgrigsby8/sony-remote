@@ -47,6 +47,7 @@ from binding import (
     CaptureTimeoutError,
     ConfigurationError,
     NotConnectedError,
+    SDKError,
     UnsupportedValueError,
 )
 from store import CaptureStore, mime_for, primary_file
@@ -119,6 +120,31 @@ _ZOOM_ENABLED = 1
 # silently overridden on the next half-press.
 _MANUAL_FOCUS_MODES = ("MF", "DMF")
 
+# Stills exposure program -> its movie counterpart (CrExposureProgram raw
+# values: M, P, A, S -> Movie M, P, A, S). Pairing them means a body found in
+# a movie mode at connect - a crash mid focus operation - can be put back in
+# exactly the stills mode it left.
+_STILLS_TO_MOVIE = {0x1: 0x8053, 0x2: 0x8050, 0x3: 0x8051, 0x4: 0x8052}
+_MOVIE_TO_STILLS = {movie: stills for stills, movie in _STILLS_TO_MOVIE.items()}
+_DEFAULT_MOVIE_MODE = 0x8053
+
+# Follow-focus read-back scale. The body reports 0xFFFF at the near stop and
+# 0 at the far stop; the module flips it so 0 is the near stop, matching the
+# emulation's "count from the near stop".
+_FOLLOW_FOCUS_MAX = 0xFFFF
+# How often a stills<->movie switch is re-checked while waiting for it.
+_MODE_POLL_S = 0.1
+# A follow-focus read is trusted once two reads this far apart agree (the lens
+# may still be moving after a nudge), or after the cap regardless.
+_FOCUS_READ_POLL_S = 0.05
+_FOCUS_READ_SETTLE_MAX_S = 1.0
+# Closed-loop give-ups, so a move ends in ok=false rather than the job
+# timeout: direction reversals (hunting around a target narrower than the
+# smallest nudge), and nudges in a row that didn't move the lens (each retried
+# one size bigger).
+_FOCUS_MAX_REVERSALS = 4
+_FOCUS_MAX_STALLS = 3
+
 # Applied at connect underneath whatever the operator configured. Mechanical is
 # the default because this rig fires a strobe: the electronic shutter reads the
 # sensor progressively, so a flash lights only the rows exposed while it fired.
@@ -158,6 +184,36 @@ class SessionConfig:
     emulated_step_size: int = 3
     emulated_travel_nudges: int = 150
     emulated_nudge_interval_s: float = 0.2
+    # Which absolute-focus mechanism to use.
+    # "auto": the body's FocusPositionSetting when it reports one, else the
+    #   near/far emulation above (the behaviour before `focus_method` existed).
+    # "movie": closed loop over the movie-mode follow-focus channel. The
+    #   ILCE-7RM5 publishes the lens's real position
+    #   (FollowFocusPositionCurrentValue) only in movie mode, so each focus
+    #   operation switches to movie, drives near/far against the read-back,
+    #   and switches back to stills. Positions run 0 (near stop) .. 65535
+    #   (far stop), units "follow_focus".
+    # "nudge": always the near/far emulation.
+    focus_method: str = "auto"
+    # When "movie" can't run (no follow-focus channel, a mode switch that
+    # won't take): "nudge" falls back to the emulation for the rest of the
+    # connection, converting positions with `movie_units_per_nudge`; "none"
+    # fails the focus operation instead.
+    movie_focus_fallback: str = "nudge"
+    # How close (follow-focus units) the read-back must land. A size-1 nudge
+    # moves roughly 700 units on the FE PZ 16-35, so much tighter than half of
+    # that can hunt.
+    movie_focus_tolerance: int = 400
+    # Longest wait for the body to finish a stills<->movie switch and for the
+    # lens to start publishing its position.
+    movie_mode_timeout_s: float = 5.0
+    # Follow-focus units moved by one nudge of `emulated_step_size`: sizes each
+    # closed-loop nudge, and converts positions when falling back to the
+    # emulation. ~2100 measured for step 3 on the FE PZ 16-35 (single nudges
+    # varied 550-2100, which is why the closed loop exists).
+    movie_units_per_nudge: float = 2100.0
+    # Nudge budget for one closed-loop move before it reports ok=false.
+    movie_max_nudges: int = 60
     # Drive focus to this position on every connect (including reconnects
     # after a camera power cycle, which can physically move the lens). With
     # emulated focus this homes first, so the rig needs no focus logic
@@ -241,13 +297,21 @@ class CameraSession:
         # invalidate it, rather than paying six round trips per shot.
         self._state_cache: Optional[Dict[str, Any]] = None
 
-        # Emulated-focus state, owner thread only. `_focus_probe` is None
-        # until the first focus operation asks whether the body reports the
-        # real property; True means "emulating over the near/far drive", and
-        # the counter is only meaningful while `_focus_homed`.
-        self._focus_probe: Optional[bool] = None
+        # Focus state, owner thread only. `_focus_backend` is None until the
+        # first focus operation resolves `focus_method` against the body:
+        # "native" (FocusPositionSetting), "movie" (follow-focus read-back)
+        # or "nudge" (emulation, whose counter is only meaningful while
+        # `_focus_homed`). Reset on every connect.
+        self._focus_backend: Optional[str] = None
+        self._focus_fallback_reason: Optional[str] = None
         self._focus_homed = False
         self._focus_counter = 0
+        # Movie backend: the last position read back, None once anything may
+        # have moved the lens since. `_movie_restore` is the stills exposure
+        # mode to return to while a focus operation has the body in movie
+        # mode; not None means "the body may still be in movie mode".
+        self._movie_known: Optional[int] = None
+        self._movie_restore: Optional[int] = None
 
         # Open-ended zoom drive watchdog (owner thread only): monotonic time
         # at which a running `zoom_drive` without a duration gets stopped.
@@ -351,12 +415,18 @@ class CameraSession:
         return self._submit("set_settings", lambda: self._do_set_settings(encoded))
 
     def get_focus_position(self) -> int:
-        return self._submit("get_focus_position", self._do_get_focus)
+        # Under `focus_method: movie` a read is two mode switches, and may
+        # fall back to homing the emulation.
+        return self._submit(
+            "get_focus_position", self._do_get_focus, timeout=self._focus_motion_budget_s()
+        )
 
     def set_focus_position(
         self, position: int, tolerance: Optional[int] = None
     ) -> Dict[str, Any]:
-        tol = int(self._config.focus_tolerance if tolerance is None else tolerance)
+        # The default tolerance depends on the backend's units, so it is
+        # resolved on the owner thread.
+        tol = None if tolerance is None else int(tolerance)
         return self._submit(
             "set_focus_position",
             lambda: self._do_set_focus(int(position), tol),
@@ -369,8 +439,10 @@ class CameraSession:
         )
 
     def home_focus(self) -> Dict[str, Any]:
-        """Re-zero emulated focus against the near stop. No-op information on
-        bodies with native absolute focus."""
+        """Re-zero emulated focus against the near stop. Under
+        `focus_method: movie`, read the real position instead (and retry movie
+        mode after a fallback). No-op information on bodies with native
+        absolute focus."""
         return self._submit(
             "home_focus", self._do_home_focus, timeout=self._focus_motion_budget_s()
         )
@@ -386,7 +458,15 @@ class CameraSession:
         """
         travel = int(self._config.emulated_travel_nudges)
         interval = max(float(self._config.emulated_nudge_interval_s), 0.005)
-        return 2 * travel * interval + 10.0
+        budget = 2 * travel * interval + 10.0
+        if self._config.focus_method == "movie":
+            # Two mode switches (each waited out up to the timeout), plus a
+            # read-back per nudge - and a failed movie attempt may still fall
+            # back to the emulation inside the same command.
+            budget += 2 * float(self._config.movie_mode_timeout_s) + int(
+                self._config.movie_max_nudges
+            ) * (interval + _FOCUS_READ_SETTLE_MAX_S)
+        return budget
 
     def focus_near_far(self, step: int) -> Dict[str, Any]:
         """One relative focus nudge: sign is direction (negative = near),
@@ -396,11 +476,14 @@ class CameraSession:
         return self._submit("focus_near_far", lambda: self._do_near_far(int(step)))
 
     def _do_near_far(self, step: int) -> Dict[str, Any]:
+        self._require_near_far()
         # The property is signed Int16; the binding layer speaks unsigned, so
         # encode two's complement here.
         self._binding.set_property("near_far", step & 0xFFFF)
-        # A manual nudge moves the lens outside the emulated count.
+        # A manual nudge moves the lens outside the emulated count, and away
+        # from the last movie-mode read-back.
         self._focus_homed = False
+        self._movie_known = None
         return {"step": step}
 
     def get_zoom(self) -> Dict[str, Any]:
@@ -574,10 +657,14 @@ class CameraSession:
             self._binding.set_save_destination(self._config.capture_dir)
             self._connected = True
             self._state_cache = None
-            # A (re)connect invalidates everything emulated focus knew: the
-            # lens may have moved while we weren't watching.
-            self._focus_probe = None
+            # A (re)connect invalidates everything focus knew: the lens may
+            # have moved while we weren't watching, and a fallback taken on
+            # the last connection deserves a fresh probe.
+            self._focus_backend = None
+            self._focus_fallback_reason = None
             self._focus_homed = False
+            self._movie_known = None
+            self._movie_restore = None
             # The body boots owning its shooting settings; until the PC takes
             # priority, remote sets are rejected (Api_InvalidCalled) or
             # silently ignored. Non-fatal like every apply: a body that
@@ -606,6 +693,8 @@ class CameraSession:
                     f"host; captures may strand in the body or go to the card: "
                     f"{exc}",
                 )
+            if self._config.focus_method == "movie":
+                self._recover_stills_mode()
             self._apply_on_connect()
             self._zoom_drive_deadline = None
             if self._config.zoom_on_connect is not None:
@@ -625,10 +714,7 @@ class CameraSession:
                     self._log("error", f"apply_on_connect failed for {detail}")
             if self._config.focus_on_connect is not None:
                 try:
-                    result = self._do_set_focus(
-                        int(self._config.focus_on_connect),
-                        int(self._config.focus_tolerance),
-                    )
+                    result = self._do_set_focus(int(self._config.focus_on_connect), None)
                     self._log(
                         "info",
                         f"focus_on_connect: position "
@@ -831,6 +917,12 @@ class CameraSession:
         started = time.monotonic()
         deadline = started + timeout_s
 
+        # A focus operation that couldn't get the body back out of movie mode
+        # left this set. Retry the switch, and refuse to fire if it still
+        # won't take - a "still" shot in movie mode is not the shot we want.
+        if self._movie_restore is not None:
+            self._exit_movie()
+
         state = self._read_state(refresh=False)
 
         # Flush anything the SDK queued before this trigger. A `file_written`
@@ -988,24 +1080,47 @@ class CameraSession:
         self._state_cache = None
         return self._read_state(refresh=True)["settings"]
 
-    # -- emulated absolute focus ---------------------------------------
+    # -- absolute focus --------------------------------------------------
     #
-    # The near/far drive is relative and blind (no position or driving-status
-    # telemetry on this body), so absolute positioning is rebuilt as: drive
-    # hard into the near stop (clamping is safe - a lens at its stop ignores
-    # further near nudges), call that zero, and count nudges from there. A
-    # position is honest only while nothing else moves the lens: autofocus and
-    # reconnects invalidate it, and the next focus operation re-homes.
+    # Three backends, picked by `focus_method` and resolved lazily against the
+    # body at the first focus operation of each connection:
+    #
+    # * native - FocusPositionSetting, written and read back directly.
+    # * movie  - the ILCE-7RM5 reports the lens's real position only in movie
+    #   mode (FollowFocusPositionCurrentValue; frozen at its last value in
+    #   stills). Each operation switches to movie, drives near/far in a closed
+    #   loop against that read-back, and switches back to stills. Nothing is
+    #   counted, so nothing needs homing and nothing can drift.
+    # * nudge  - the near/far drive is relative and blind, so absolute
+    #   positioning is rebuilt as: drive hard into the near stop (clamping is
+    #   safe - a lens at its stop ignores further near nudges), call that
+    #   zero, count nudges from there. Honest only while nothing else moves
+    #   the lens: autofocus, zoom and reconnects invalidate it, and the next
+    #   focus operation re-homes. Also the fallback when movie can't run.
 
-    def _focus_is_emulated(self) -> bool:
-        if self._config.focus_emulation == "off":
-            return False
-        if self._focus_probe is None:
+    def _resolve_focus_backend(self) -> str:
+        if self._focus_backend is not None:
+            return self._focus_backend
+        method = self._config.focus_method
+        if method == "movie":
+            # Not probed up front: the first movie operation is the probe, and
+            # a failure there falls back (see `_movie_or_fallback`).
+            self._focus_backend = "movie"
+        elif method == "nudge":
+            self._focus_backend = "nudge"
+            self._log(
+                "info",
+                "focus_method nudge: positions are nudge counts from the near "
+                "stop; autofocus, zoom and reconnects re-home.",
+            )
+        elif self._config.focus_emulation == "off":
+            self._focus_backend = "native"
+        else:
             try:
                 self._binding.get_property("focus_position")
-                self._focus_probe = False
+                self._focus_backend = "native"
             except UnsupportedValueError:
-                self._focus_probe = True
+                self._focus_backend = "nudge"
                 self._log(
                     "info",
                     "body does not report an absolute focus position; emulating "
@@ -1013,19 +1128,281 @@ class CameraSession:
                     "from the near stop; autofocus and reconnects re-home.",
                 )
             except CameraError:
-                return False  # transient - probe again next time
-        return bool(self._focus_probe)
+                return "native"  # transient - probe again next time
+        return self._focus_backend
+
+    def _focus_is_emulated(self) -> bool:
+        return self._resolve_focus_backend() == "nudge"
+
+    def _movie_or_fallback(
+        self, movie_op: Callable[[], Any], nudge_op: Callable[[], Any]
+    ) -> Any:
+        """Run `movie_op`; if movie mode can't do the job, fall back.
+
+        A disconnect or a rig problem the emulation shares (the near/far drive
+        disabled) is raised as is - nudging can't help with either. Anything
+        else switches this connection to the emulation when
+        `movie_focus_fallback` allows it, and runs `nudge_op` in its place.
+        """
+        try:
+            return movie_op()
+        except (NotConnectedError, ConfigurationError):
+            raise
+        except CameraError as exc:
+            if self._config.movie_focus_fallback != "nudge":
+                raise
+            reason = f"movie-mode focus failed: {exc.message}"
+            self._focus_backend = "nudge"
+            self._focus_fallback_reason = reason
+            self._focus_homed = False
+            self._movie_known = None
+            self._log(
+                "warning",
+                f"{reason}; falling back to the near/far emulation until the "
+                "next connect or home_focus",
+            )
+            return nudge_op()
+
+    def _require_near_far(self) -> None:
+        """Fail loudly when the body has disabled the near/far drive.
+
+        It does so without an error: writes are accepted and ignored, so every
+        nudge "succeeds" and the lens never moves. On the ILCE-7RM5 that is
+        the lens's AF/MF switch in MF - the body then hands focus to the ring
+        and reports NearFar as not settable.
+        """
+        try:
+            prop = self._binding.get_property("near_far")
+        except CameraError:
+            return  # a body that doesn't report it can't tell us; try anyway
+        if not prop.writable:
+            raise ConfigurationError(
+                "the body has disabled the near/far focus drive, so focus can't "
+                "be moved remotely - nudges would be silently ignored. On the "
+                "ILCE-7RM5 this is the lens's AF/MF switch set to MF: set it to "
+                "AF (the body stays in MF)."
+            )
 
     def _nudge_focus(self, step: int) -> None:
         # Signed Int16 on the wire; the binding layer speaks unsigned.
         self._binding.set_property("near_far", step & 0xFFFF)
         time.sleep(self._config.emulated_nudge_interval_s)
 
+    # -- movie-mode follow focus -----------------------------------------
+
+    def _exposure_mode(self) -> int:
+        return int(self._binding.get_property("exposure_program_mode").value)
+
+    def _wait_for(self, predicate: Callable[[], bool], what: str) -> None:
+        timeout = float(self._config.movie_mode_timeout_s)
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                if predicate():
+                    return
+            except BusyError:
+                pass
+            if time.monotonic() >= deadline:
+                raise SDKError(f"timed out after {timeout:g}s waiting for {what}")
+            time.sleep(_MODE_POLL_S)
+
+    def _enter_movie(self) -> None:
+        current = self._exposure_mode()
+        if current in _MOVIE_TO_STILLS:
+            # Already in movie: an earlier operation never made it back.
+            if self._movie_restore is None:
+                self._movie_restore = _MOVIE_TO_STILLS[current]
+        else:
+            movie = _STILLS_TO_MOVIE.get(current, _DEFAULT_MOVIE_MODE)
+            # Recorded before the write, so a switch that half-happens is
+            # still undone.
+            self._movie_restore = current
+            self._state_cache = None
+            self._retry_busy(
+                lambda: self._binding.set_property("exposure_program_mode", movie)
+            )
+            self._wait_for(
+                lambda: self._exposure_mode() == movie,
+                "the body to switch to movie mode",
+            )
+        self._wait_for(
+            lambda: int(self._binding.get_property("lens_info_enable").value) == 1,
+            "the lens to publish its focus position (LensInformationEnableStatus)",
+        )
+
+    def _exit_movie(self) -> None:
+        stills = self._movie_restore
+        if stills is None:
+            return
+        self._state_cache = None
+        self._retry_busy(
+            lambda: self._binding.set_property("exposure_program_mode", stills)
+        )
+        self._wait_for(
+            lambda: self._exposure_mode() == stills,
+            "the body to switch back to stills mode",
+        )
+        self._movie_restore = None
+
+    def _in_movie(self, fn: Callable[[], Any]) -> Any:
+        """Run `fn` with the body in movie mode, and always try to leave it.
+
+        A failure to get back to stills is raised (the caller's work is moot
+        if the next capture would record in movie mode), and `_movie_restore`
+        stays set so the next capture retries the switch before firing.
+        """
+        try:
+            self._enter_movie()
+            result = fn()
+        except BaseException:
+            try:
+                self._exit_movie()
+            except CameraError as exc:
+                self._log(
+                    "error",
+                    f"could not return the body to stills mode ({exc}); "
+                    "captures retry the switch and fail until it takes",
+                )
+            raise
+        self._exit_movie()
+        return result
+
+    def _recover_stills_mode(self) -> None:
+        """At connect: a body left in movie mode by an interrupted focus
+        operation goes back to the stills mode it was in."""
+        try:
+            current = self._exposure_mode()
+        except CameraError as exc:
+            self._log("warning", f"could not read the exposure program mode: {exc}")
+            return
+        stills = _MOVIE_TO_STILLS.get(current)
+        if stills is None:
+            return
+        self._log(
+            "warning",
+            f"body is in movie mode (exposure program 0x{current:X}) at connect, "
+            f"most likely from an interrupted focus operation; switching back "
+            f"to stills (0x{stills:X})",
+        )
+        self._movie_restore = stills
+        try:
+            self._exit_movie()
+        except CameraError as exc:
+            detail = f"return to stills mode: {exc}"
+            self._apply_errors.append(detail)
+            self._log("error", f"apply_on_connect failed for {detail}")
+
+    def _movie_read(self) -> int:
+        """The lens's position, 0 (near stop) .. 65535 (far stop), once the
+        read-back has stopped changing (the lens may still be moving)."""
+
+        def once() -> int:
+            raw = int(self._binding.get_property("follow_focus_position").value)
+            return _FOLLOW_FOCUS_MAX - max(0, min(_FOLLOW_FOCUS_MAX, raw))
+
+        value = once()
+        deadline = time.monotonic() + _FOCUS_READ_SETTLE_MAX_S
+        while time.monotonic() < deadline:
+            time.sleep(_FOCUS_READ_POLL_S)
+            again = once()
+            if again == value:
+                break
+            value = again
+        return value
+
+    def _movie_drive(self, target: int, tolerance: int) -> Tuple[int, int]:
+        """Closed loop: nudge toward `target` until the read-back is within
+        `tolerance`. Returns (position, nudges). Must run in movie mode.
+
+        Nudge size follows the remaining distance (one size-1 nudge is about
+        `movie_units_per_nudge / emulated_step_size` units). An overshoot caps
+        the size below the one that overshot; a nudge the lens ignored (a
+        size-1 sometimes moves nothing) earns a bigger one.
+        """
+        per_size = float(self._config.movie_units_per_nudge) / max(
+            1, int(self._config.emulated_step_size)
+        )
+        pos = self._movie_read()
+        nudges = stalls = reversals = 0
+        cap, last_sign, last_size = 7, 0, 0
+        while abs(target - pos) > tolerance and nudges < int(self._config.movie_max_nudges):
+            error = target - pos
+            sign = 1 if error > 0 else -1  # positive near/far drives toward far
+            if last_sign and sign != last_sign:
+                reversals += 1
+                if reversals > _FOCUS_MAX_REVERSALS:
+                    break  # hunting around a target the steps can't land in
+                cap = max(1, last_size - 1)
+            size = max(1, min(cap, round(abs(error) / per_size)))
+            size = min(7, size + stalls)
+            self._nudge_focus(sign * size)
+            nudges += 1
+            last_sign, last_size = sign, size
+            moved_to = self._movie_read()
+            if moved_to == pos:
+                at_stop = moved_to <= 0 if sign < 0 else moved_to >= _FOLLOW_FOCUS_MAX
+                stalls += 1
+                if at_stop or stalls > _FOCUS_MAX_STALLS:
+                    break
+            else:
+                stalls = 0
+            pos = moved_to
+        return pos, nudges
+
+    def _do_set_focus_movie(self, target: int, tolerance: int) -> Dict[str, Any]:
+        self._require_near_far()
+        clamped = max(0, min(int(target), _FOLLOW_FOCUS_MAX))
+        if clamped != target:
+            self._log(
+                "warning",
+                f"focus target {target} clamped to {clamped} "
+                f"(valid range 0..{_FOLLOW_FOCUS_MAX})",
+            )
+        self._movie_known = None
+        position, nudges = self._in_movie(lambda: self._movie_drive(clamped, tolerance))
+        self._movie_known = position
+        self._state_cache = None
+        ok = abs(position - clamped) <= tolerance
+        if not ok:
+            self._log(
+                "warning",
+                f"focus did not reach {clamped} after {nudges} nudge(s): read "
+                f"back {position} (tolerance {tolerance}). If it never moved, "
+                "check that nothing is holding the focus ring.",
+            )
+        return {
+            "position": position,
+            "target": clamped,
+            "tolerance": tolerance,
+            "attempts": nudges,
+            "ok": ok,
+            "units": "follow_focus",
+            "method": "movie",
+        }
+
+    def _do_read_focus_movie(self) -> int:
+        position = self._in_movie(self._movie_read)
+        self._movie_known = position
+        return position
+
+    # -- emulated (nudge) focus ------------------------------------------
+
+    def _nudge_units(self) -> bool:
+        """Whether positions are follow-focus units even though the emulation
+        is driving: the movie backend's fallback keeps the caller's units."""
+        return self._config.focus_method == "movie"
+
+    def _from_nudges(self, count: int) -> int:
+        if self._nudge_units():
+            return int(round(count * float(self._config.movie_units_per_nudge)))
+        return count
+
     def _ensure_focus_homed(self) -> None:
         if self._focus_homed:
             return
         budget = int(self._config.emulated_travel_nudges)
         step = int(self._config.emulated_step_size)
+        self._require_near_far()
         self._log(
             "info",
             f"homing focus: {budget} nudges of size {step} toward the near stop",
@@ -1037,25 +1414,51 @@ class CameraSession:
         self._focus_homed = True
         self._state_cache = None
 
-    def _do_home_focus(self) -> Dict[str, Any]:
-        if not self._focus_is_emulated():
-            return {
-                "emulated": False,
-                "note": "this body reports absolute focus natively; homing is "
-                "not used",
-            }
+    def _home_emulated(self) -> Dict[str, Any]:
         self._focus_homed = False
         self._ensure_focus_homed()
-        return {"emulated": True, "position": 0, "units": "emulated_nudges"}
+        units = "follow_focus" if self._nudge_units() else "emulated_nudges"
+        return {"emulated": True, "position": 0, "units": units}
+
+    def _do_home_focus(self) -> Dict[str, Any]:
+        if self._config.focus_method == "movie" and self._focus_backend == "nudge":
+            # A fallback taken earlier gets another chance at every home: the
+            # webapp homes once per session, so one bad moment doesn't stick
+            # for the rest of the connection.
+            self._focus_backend = None
+            self._focus_fallback_reason = None
+        backend = self._resolve_focus_backend()
+        if backend == "movie":
+
+            def movie() -> Dict[str, Any]:
+                position = self._do_read_focus_movie()
+                return {
+                    "emulated": False,
+                    "method": "movie",
+                    "position": position,
+                    "units": "follow_focus",
+                }
+
+            return self._movie_or_fallback(movie, self._home_emulated)
+        if backend == "nudge":
+            return self._home_emulated()
+        return {
+            "emulated": False,
+            "note": "this body reports absolute focus natively; homing is "
+            "not used",
+        }
 
     def _do_set_focus_emulated(self, target: int) -> Dict[str, Any]:
+        self._require_near_far()
         self._ensure_focus_homed()
+        per_nudge = float(self._config.movie_units_per_nudge)
+        wanted = int(round(target / per_nudge)) if self._nudge_units() else int(target)
         limit = int(self._config.emulated_travel_nudges)
-        clamped = max(0, min(int(target), limit))
-        if clamped != target:
+        clamped = max(0, min(wanted, limit))
+        if clamped != wanted:
             self._log(
                 "warning",
-                f"emulated focus target {target} clamped to {clamped} "
+                f"emulated focus target {wanted} clamped to {clamped} "
                 f"(valid range 0..{limit})",
             )
         step = int(self._config.emulated_step_size)
@@ -1064,6 +1467,18 @@ class CameraSession:
             self._nudge_focus(sign * step)
             self._focus_counter += sign
         self._state_cache = None
+        if self._nudge_units():
+            return {
+                "position": self._from_nudges(self._focus_counter),
+                "target": int(target),
+                "tolerance": 0,
+                "attempts": 1,
+                "ok": True,
+                "units": "follow_focus",
+                "method": "nudge_fallback",
+                # Converted from a nudge count, not read back.
+                "estimated": True,
+            }
         return {
             "position": self._focus_counter,
             "target": clamped,
@@ -1074,16 +1489,32 @@ class CameraSession:
         }
 
     def _do_get_focus(self) -> int:
-        if self._focus_is_emulated():
+        backend = self._resolve_focus_backend()
+        if backend == "movie":
+
+            def nudge() -> int:
+                self._ensure_focus_homed()
+                return self._from_nudges(self._focus_counter)
+
+            return self._movie_or_fallback(self._do_read_focus_movie, nudge)
+        if backend == "nudge":
             self._ensure_focus_homed()
-            return self._focus_counter
+            return self._from_nudges(self._focus_counter)
         value = self._binding.get_property("focus_position").value
         return int(value)
 
-    def _do_set_focus(self, position: int, tolerance: int) -> Dict[str, Any]:
+    def _do_set_focus(self, position: int, tolerance: Optional[int]) -> Dict[str, Any]:
         self._ensure_manual_focus()
-        if self._focus_is_emulated():
+        backend = self._resolve_focus_backend()
+        if backend == "movie":
+            tol = int(self._config.movie_focus_tolerance if tolerance is None else tolerance)
+            return self._movie_or_fallback(
+                lambda: self._do_set_focus_movie(position, tol),
+                lambda: self._do_set_focus_emulated(position),
+            )
+        if backend == "nudge":
             return self._do_set_focus_emulated(position)
+        tolerance = int(self._config.focus_tolerance if tolerance is None else tolerance)
 
         achieved = None
         attempts = 0
@@ -1146,7 +1577,13 @@ class CameraSession:
     def _do_autofocus(self) -> Dict[str, Any]:
         acquired = self._binding.autofocus_once(self._config.autofocus_timeout_s)
         self._state_cache = None
-        if self._focus_is_emulated():
+        backend = self._resolve_focus_backend()
+        if backend == "movie":
+            # Reading where AF landed would cost two mode switches; the
+            # caller can ask get_focus_position if it wants to know.
+            self._movie_known = None
+            return {"position": None, "units": "follow_focus", "acquired": acquired}
+        if backend == "nudge":
             # AF moved the lens an unknown amount; the counter is now a lie.
             self._focus_homed = False
             self._log(
@@ -1228,7 +1665,8 @@ class CameraSession:
 
     def _note_zoom_moved(self) -> None:
         self._state_cache = None
-        if self._focus_probe and self._focus_homed:
+        self._movie_known = None
+        if self._focus_backend == "nudge" and self._focus_homed:
             self._focus_homed = False
             self._log(
                 "info",
@@ -1480,8 +1918,15 @@ class CameraSession:
             "connect_attempts": self._connect_attempts,
             "last_error": self._last_error,
             "apply_errors": list(self._apply_errors),
-            "focus_emulated": bool(self._focus_probe),
-            "focus_homed": bool(self._focus_homed) if self._focus_probe else None,
+            "focus_emulated": self._focus_backend == "nudge",
+            "focus_homed": (
+                bool(self._focus_homed) if self._focus_backend == "nudge" else None
+            ),
+            # The backend actually in use (None until the first focus
+            # operation of this connection), and why a configured "movie"
+            # isn't it.
+            "focus_method": self._focus_backend,
+            "focus_fallback_reason": self._focus_fallback_reason,
         }
 
     # ------------------------------------------------------------------
@@ -1547,8 +1992,13 @@ class CameraSession:
                 # entry is unsupported.
                 continue
 
-        if self._focus_is_emulated():
-            focus = self._focus_counter if self._focus_homed else None
+        # Never resolves a "movie" backend here: that would switch modes in
+        # the middle of a capture's audit read. Movie reports the last
+        # read-back, or None once anything may have moved the lens since.
+        if self._config.focus_method == "movie" and self._focus_backend != "nudge":
+            focus = self._movie_known
+        elif self._focus_is_emulated():
+            focus = self._from_nudges(self._focus_counter) if self._focus_homed else None
         else:
             try:
                 focus = int(self._binding.get_property("focus_position").value)

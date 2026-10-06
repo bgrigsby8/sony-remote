@@ -54,6 +54,12 @@ Every attribute is optional.
 | `emulated_travel_nudges` | number | `150` | Homing budget and position ceiling: this many nudges must cross the lens's full travel with margin. Calibrate per lens with `focus_near_far`. |
 | `emulated_nudge_interval_s` | number | `0.03` | Pause after each nudge, letting the drive settle. |
 | `focus_on_connect` | number | — | Drive focus to this position on every connect, including reconnects after a camera power cycle (which can physically move a power-zoom lens). With emulated focus this homes first. For a rig whose stations share one focus plane, this single number replaces all other focus handling; a failure is recorded in `apply_errors`, never fatal. |
+| `focus_method` | string | `"auto"` | `"auto"`: the body's own absolute focus if it reports one, else the near/far emulation (the behaviour before this attribute existed). `"movie"`: closed loop on the lens's real position, read from the movie-mode follow-focus channel — see [Movie-mode focus](#movie-mode-focus). `"nudge"`: always the emulation. |
+| `movie_focus_fallback` | string | `"nudge"` | What `"movie"` does when movie mode can't run (no follow-focus channel, a mode switch that won't take): `"nudge"` switches to the emulation until the next connect or `home_focus`, keeping positions in follow-focus units; `"none"` fails the focus command. `"nudge"` is invalid with `focus_emulation: "off"`. |
+| `movie_focus_tolerance` | number | `400` | How close, in follow-focus units (0–65535), the read-back must land. One size-1 nudge is ~700 units on the FE PZ 16-35, so much tighter than half that can hunt. Overridable per call. |
+| `movie_mode_timeout_s` | number | `5` | Longest wait for a stills↔movie switch, and for the lens to start publishing its position. |
+| `movie_units_per_nudge` | number | `2100` | Follow-focus units per nudge of `emulated_step_size`: sizes each closed-loop nudge, and converts positions under the fallback. ~2100 measured for step 3 on the FE PZ 16-35. |
+| `movie_max_nudges` | number | `60` | Nudge budget for one closed-loop move before it reports `ok: false`. |
 
 `apply_on_connect` values are validated all the way down to their raw SDK
 encoding when the machine config is saved, so a mistyped aperture is a config
@@ -164,6 +170,44 @@ into the near stop and calls that zero, which takes
 `emulated_travel_nudges × emulated_nudge_interval_s` seconds. Calibration works
 exactly as before: store the integer, play it back.
 
+With `focus_method: "movie"`, `units` is `"follow_focus"` and the position is
+**read from the lens**, not counted: 0 at the near stop, 65535 at the far stop.
+Each read costs two mode switches (about 4s on the A7R V); see
+[Movie-mode focus](#movie-mode-focus).
+
+### Movie-mode focus
+
+The ILCE-7RM5 does report where its lens is focused — `FollowFocusPositionCurrentValue`
+— but **only in movie mode**. In stills mode the value freezes at whatever it
+read last in movie mode. With `focus_method: "movie"` every focus command:
+
+1. switches the body to the movie counterpart of its stills mode (M → Movie M,
+   P → Movie P, …) and waits until the lens publishes its position;
+2. reads it, and for `set_focus_position` nudges near/far in a closed loop until
+   the read-back is within `movie_focus_tolerance` (nudge size follows the
+   remaining distance; an overshoot steps the size down);
+3. switches back to the stills mode it found.
+
+Nothing is counted, so nothing homes, drifts, or needs re-homing after
+autofocus, zoom or a reconnect: a hand on the focus ring shows up in the next
+read. The cost is the round trip, about 4s per command on the A7R V.
+
+Safety nets: a body found in movie mode at connect (a focus command
+interrupted mid-way) is switched back to stills, and `capture` refuses to fire
+— with an `[sdk_error]` naming the stills switch — while a failed switch-back
+is outstanding. `get_status` reports `focus_method` (the backend actually in
+use) and `focus_fallback_reason`.
+
+When movie mode fails and `movie_focus_fallback` is `"nudge"`, the command
+completes on the emulation instead, converting positions with
+`movie_units_per_nudge` (results then carry `"method": "nudge_fallback"` and
+`"estimated": true`). `home_focus` retries movie mode.
+
+**The lens's AF/MF switch must be on AF** (set MF on the body). With the lens
+switch on MF the body disables the near/far drive and silently ignores every
+nudge; every command that nudges (movie, the emulation, `focus_near_far`) now
+fails with a `[configuration]` error saying so instead.
+
 ### `set_focus_position`
 
 ```json
@@ -182,6 +226,14 @@ once if the read-back is further than `tolerance` from the target.
 A second miss returns `"ok": false` with the position it did reach, rather than
 retrying forever — whether that's good enough for a given station is the
 caller's call.
+
+Under `focus_method: "movie"`, `attempts` is the number of nudges and `ok` is
+an honest read-back comparison — `false` means the lens really isn't there:
+
+```json
+{"position": 30112, "target": 30000, "tolerance": 400,
+ "attempts": 9, "ok": true, "units": "follow_focus", "method": "movie"}
+```
 
 ### `focus_near_far`
 
@@ -205,6 +257,11 @@ Re-zero emulated focus against the near stop. Sweep orchestration should call
 this at sweep start so per-station positions stay honest; it is otherwise
 called automatically by the first focus operation that needs it. On bodies
 with native absolute focus it reports `{"emulated": false}` and does nothing.
+
+Under `focus_method: "movie"` nothing needs zeroing: it reads the lens's real
+position instead, without moving it, and gives movie mode another chance if an
+earlier command fell back to the emulation —
+`{"emulated": false, "method": "movie", "position": 30112, "units": "follow_focus"}`.
 
 ### `autofocus_once`
 

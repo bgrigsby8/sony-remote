@@ -90,6 +90,14 @@ _DEFAULT_PROPERTIES: Dict[str, Dict[str, Any]] = {
     # Relative focus drive (signed Int16 on the wire, two's complement).
     # Setting it moves focus_position; see set_property.
     "near_far": {"value": 0, "choices": []},
+    # Raw CrExposureProgram: 0x1 is stills M, 0x8053 Movie M.
+    "exposure_program_mode": {"value": 0x1, "choices": []},
+    # Movie-mode follow focus: 1 while the lens publishes its position (movie
+    # mode only), and that position (0xFFFF near stop .. 0 far stop), live in
+    # movie mode and frozen at its last movie value in stills. Both computed
+    # on read; see get_property.
+    "lens_info_enable": {"value": 0, "choices": []},
+    "follow_focus_position": {"value": 0, "choices": []},
     # Power zoom, modelled on an FE PZ 16-35mm F4 G. zoom_distance and
     # zoom_speed_range are Range properties: choices are {min, max, step}.
     # zoom_distance's value is computed from the drive model on every read.
@@ -152,6 +160,17 @@ class FakeCamera(CameraBinding):
         # session's emulation layer takes over. The internal focus_position
         # value keeps tracking the physical truth for assertions.
         self.absolute_focus_supported = True
+        # Movie-mode follow focus, modelled on the ILCE-7RM5: switching
+        # `exposure_program_mode` to a movie value makes `follow_focus_position`
+        # track the lens. False -> the lens never publishes it (lens_info_enable
+        # stays 0). `mode_switch_works=False` -> the body accepts mode writes
+        # and ignores them.
+        self.movie_focus_supported = True
+        self.mode_switch_works = True
+        # False models the lens's AF/MF switch on MF: near_far reads as not
+        # writable, and writes are accepted and ignored - the lens never moves.
+        self.near_far_enabled = True
+        self._follow_latched = 0
         # Zoom drive model: focal length moves `zoom_um_per_s_per_speed` per
         # second per unit of speed, clamped to the lens's range, keeps moving
         # for `zoom_coast_s` after a stop, and reads back rounded to
@@ -217,6 +236,16 @@ class FakeCamera(CameraBinding):
     def property_value(self, name: str) -> Any:
         """Peek at a raw property without going through the module."""
         return self._properties[name]["value"]
+
+    def in_movie_mode(self) -> bool:
+        return self._properties["exposure_program_mode"]["value"] >= 0x8050
+
+    def follow_focus_now(self) -> int:
+        """What the body would report as FollowFocusPositionCurrentValue for
+        the lens's physical position: 0xFFFF at the near stop, 0 at far."""
+        span = max(1, self.focus_max - self.focus_min)
+        physical = self._properties["focus_position"]["value"] - self.focus_min
+        return 0xFFFF - int(round(physical * 0xFFFF / span))
 
     def zoom_true_um(self) -> float:
         """The simulated lens's exact focal length, for assertions."""
@@ -342,10 +371,21 @@ class FakeCamera(CameraBinding):
             value = int(round(self._zoom_um / quantum) * quantum)
         elif name == "zoom_operation_status" and not self.power_zoom:
             value = 0
+        elif name == "lens_info_enable":
+            value = 1 if self.movie_focus_supported and self.in_movie_mode() else 0
+        elif name == "follow_focus_position":
+            if not self.movie_focus_supported:
+                raise UnsupportedValueError(f"this body does not report property {name!r}")
+            if self.in_movie_mode():
+                self._follow_latched = self.follow_focus_now()
+            value = self._follow_latched
+        writable = bool(prop.get("writable", True))
+        if name == "near_far":
+            writable = self.near_far_enabled
         return PropertyValue(
             value=value,
             choices=list(prop.get("choices") or []),
-            writable=bool(prop.get("writable", True)),
+            writable=writable,
             range=bool(prop.get("range", False)),
         )
 
@@ -389,6 +429,15 @@ class FakeCamera(CameraBinding):
             self._set_zoom_speed(0)
             self._zoom_um = float(self.zoom_presets[int(value)])
             self._zoom_since = time.monotonic()
+        elif name == "exposure_program_mode":
+            if self.mode_switch_works:
+                if self.in_movie_mode() and self.movie_focus_supported:
+                    self._follow_latched = self.follow_focus_now()
+                prop["value"] = value
+        elif name == "near_far" and not self.near_far_enabled:
+            # Accepted and ignored, exactly like the body with the lens's
+            # AF/MF switch on MF.
+            prop["value"] = 0
         elif name == "near_far":
             # Signed Int16 on the wire (two's complement); each write nudges
             # focus by `near_far_units_per_step` per unit of magnitude, clamped

@@ -276,7 +276,9 @@ class CommandHandler:
         """Re-zero emulated focus against the lens's near stop.
 
         Sweep orchestration calls this at sweep start so per-station positions
-        stay honest. Informational no-op on bodies with native absolute focus.
+        stay honest. Under `focus_method: movie` it reads the real position
+        instead of moving the lens. Informational no-op on bodies with native
+        absolute focus.
         """
         return await _to_thread(self._session.home_focus)
 

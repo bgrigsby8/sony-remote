@@ -290,6 +290,12 @@ Known limitations:
   autofocus, manual nudges and reconnects invalidate the count and the next
   focus operation re-homes. See `focus_emulation` and friends in the
   [model reference](brad-grigsby_sony-remote_camera.md).
+- **Real focus position is movie-mode only.** The body does publish where the
+  lens is focused (`FollowFocusPositionCurrentValue`), but only in movie mode;
+  in stills it freezes. `focus_method: "movie"` switches to movie mode for each
+  focus command, closes the loop on that read-back, and switches back (~4s per
+  command), with the emulation as a configurable fallback. See
+  [Movie-mode focus](brad-grigsby_sony-remote_camera.md#movie-mode-focus).
 - **Zoom is closed-loop, not commanded.** `ZoomPositionSetting` is refused
   too, but with a power-zoom lens (verified: FE PZ 16-35mm F4 G) the
   continuous zoom drive works and the focal length reads back, so `set_zoom`

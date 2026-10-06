@@ -97,11 +97,26 @@ class TestValidateConfig:
             ({"focus_tolerance": -1}, "focus_tolerance"),
             ({"binding": "usb"}, "binding"),
             ({"apply_on_connect": "f/11"}, "apply_on_connect"),
+            ({"focus_method": "follow"}, "focus_method"),
+            ({"focus_method": "movie", "movie_focus_fallback": "af"}, "movie_focus_fallback"),
+            ({"movie_focus_tolerance": -1}, "movie_focus_tolerance"),
+            ({"movie_mode_timeout_s": 0}, "movie_mode_timeout_s"),
+            ({"movie_units_per_nudge": 0}, "movie_units_per_nudge"),
+            ({"movie_max_nudges": 0}, "movie_max_nudges"),
+            ({"focus_method": "nudge", "focus_emulation": "off"}, "focus_emulation"),
+            # The default fallback is the emulation that "off" forbids.
+            ({"focus_method": "movie", "focus_emulation": "off"}, "movie_focus_fallback"),
         ],
     )
     def test_rejects_bad_attributes(self, attributes, fragment):
         with pytest.raises(ValueError, match=fragment):
             Camera.validate_config(make_config(**attributes))
+
+    def test_movie_focus_without_the_emulation_is_valid_with_no_fallback(self):
+        config = make_config(
+            focus_method="movie", focus_emulation="off", movie_focus_fallback="none"
+        )
+        assert Camera.validate_config(config) == ([], [])
 
     def test_a_mistyped_setting_is_caught_at_config_time(self):
         # Not at capture time, hours later, in a shot nobody looks at until
