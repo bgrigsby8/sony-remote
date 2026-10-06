@@ -26,6 +26,9 @@ against, because those are the ones the module exists to handle:
 * **Focus doesn't land where you put it.** `focus_error_sequence` makes the
   first `set_focus_position` miss and the second land, which is the whole
   reason `set_focus_position` reads back and retries.
+* **The directory is not yours alone.** `foreign_files` drops files nobody
+  announces into the save directory just before the shot lands - the
+  `color-correction` export that a production machine mistook for its capture.
 
 Test knobs are plain attributes, settable at any time - a test can `unplug()`
 mid-capture and watch the session fail fast.
@@ -150,6 +153,12 @@ class FakeCamera(CameraBinding):
         self.autofocus_position = 140
         # Set to raise BusyError from the next set_property / trigger_capture.
         self.busy_once = False
+        # Basenames another program "writes" into the save directory after the
+        # shutter fires and before the body's own files land, with no event
+        # for any of them. Their mtime is backdated by `foreign_file_age_s` so
+        # that "newest wins" is decidable when a test wants it to be.
+        self.foreign_files: List[str] = []
+        self.foreign_file_age_s = 1.0
         # near_far modelling: units of focus_position moved per unit of step
         # magnitude, and the travel stops the drive clamps against.
         self.near_far_units_per_step = 2
@@ -525,6 +534,17 @@ class FakeCamera(CameraBinding):
             names.append((f"DSC{self._seq:05d}.ARW", _RAW_BYTES))
         if fmt in ("JPEG", "RAW_JPEG"):
             names.append((f"DSC{self._seq:05d}.JPG", _JPEG_BYTES))
+
+        # Someone else's files land first: after the session's pre-trigger
+        # snapshot, before anything this body announces.
+        for name in self.foreign_files:
+            path = os.path.join(self.save_destination or ".", name)
+            payload = _RAW_BYTES if name.lower().endswith((".arw", ".raw", ".dng")) else _JPEG_BYTES
+            with open(path, "wb") as handle:
+                handle.write(payload)
+            if self.foreign_file_age_s > 0:
+                stamp = time.time() - self.foreign_file_age_s
+                os.utime(path, (stamp, stamp))
 
         self._events.put(Event(EVENT_CAPTURE_COMPLETE, {}))
 

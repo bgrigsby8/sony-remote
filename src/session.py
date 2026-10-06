@@ -50,7 +50,7 @@ from binding import (
     SDKError,
     UnsupportedValueError,
 )
-from store import CaptureStore, mime_for, primary_file
+from store import CaptureStore, exts_for_format, mime_for, primary_file
 
 # Reconnect backoff. Starts eager (a replug should recover in well under a
 # second) and caps low enough that a camera powered on hours later is picked up
@@ -161,6 +161,11 @@ class SessionConfig:
     capture_dir: str = "/tmp/sony-remote"
     serial: Optional[str] = None
     retention_max_files: int = 200
+    # Whether a capture candidate must be named like the body names stills
+    # (`DSCnnnnn.<ext>`). Together with the file-format extension check this is
+    # what stops another program's file in `capture_dir` being returned as the
+    # shot. Only turn it off for a body configured with a custom name prefix.
+    strict_capture_names: bool = True
     live_view_max_fps: float = 10.0
     connect_timeout_s: float = 10.0
     capture_timeout_s: float = 15.0
@@ -261,7 +266,10 @@ class CameraSession:
         self._config = config
         self._logger = logger
         self._store = CaptureStore(
-            config.capture_dir, config.retention_max_files, logger=logger
+            config.capture_dir,
+            config.retention_max_files,
+            logger=logger,
+            strict_names=config.strict_capture_names,
         )
 
         self._queue: "queue.Queue[_Job]" = queue.Queue()
@@ -964,6 +972,9 @@ class CameraSession:
             sizes[path] = size
 
         count = self._store.increment_capture_count()
+        # Retention only ever touches files this module recorded writing, so
+        # the record has to be made before the prune that follows.
+        self._store.record_written(paths)
         removed = self._store.prune()
         primary = primary_file(paths)
         duration = time.monotonic() - started
@@ -1005,18 +1016,28 @@ class CameraSession:
         1. `file_written` events carrying a path - authoritative when present.
         2. Diffing `capture_dir` against the pre-trigger snapshot - the fallback
            for an SDK build that reports completion without a filename. Safe
-           because the snapshot was taken *after* the previous capture settled,
-           so nothing old can be mistaken for new.
+           against *old* files because the snapshot was taken after the
+           previous capture settled; safe against *foreign* files because a
+           candidate must carry an extension the current `file_format` can
+           produce and (unless `strict_capture_names` is off) the body's own
+           `DSCnnnnn.<ext>` name. A `.jpg` another component exported into a
+           shared directory mid-capture fails both in "raw", which is exactly
+           what was returned as the capture before this filter existed.
 
         In RAW+JPEG the body writes two files and doesn't promise an order, so
-        we wait for the expected count rather than the first arrival.
+        we wait for the expected count rather than the first arrival. If the
+        diff turns up *more* candidates than expected, the ones the SDK named
+        win, then the newest by mtime - and the choice is logged.
 
         Returns `(paths, named_by_sdk)`; the caller uses the flag to decide
         whether it still has to wait for the files to finish writing.
         """
-        expected = 2 if snapshot.get("file_format") in ("raw+jpeg", "raw+heif") else 1
+        file_format = snapshot.get("file_format")
+        expected = 2 if file_format in ("raw+jpeg", "raw+heif") else 1
+        exts = exts_for_format(file_format)
         found: List[str] = []
         found_named = False
+        rejected: Set[str] = set()
 
         while time.monotonic() < deadline:
             if not self._connected:
@@ -1030,18 +1051,30 @@ class CameraSession:
 
             # Belt and braces against a straggler event from the previous shot:
             # a path that already existed before the trigger is not this
-            # capture's, whatever the SDK says.
-            named = [
-                p
-                for p in self._capture_files
-                if p and os.path.basename(p) not in before
-            ]
+            # capture's, whatever the SDK says. Nor is a file whose type the
+            # current format can't produce or whose name isn't the camera's.
+            named: List[str] = []
+            for path in self._capture_files:
+                if not path or os.path.basename(path) in before:
+                    continue
+                if not self._store.accepts(path, exts):
+                    if path not in rejected:
+                        rejected.add(path)
+                        self._log(
+                            "warning",
+                            f"ignoring file_written for {path}: not a "
+                            f"{file_format or 'camera'} still "
+                            "(wrong extension or not named DSCnnnnn)",
+                        )
+                    continue
+                if path not in named:
+                    named.append(path)
             if len(named) >= expected:
                 return named, True
 
-            diffed = self._store.new_files_since(before)
+            diffed = self._store.new_files_since(before, exts)
             if len(diffed) >= expected:
-                return diffed, False
+                return self._choose_candidates(diffed, named, expected), False
 
             found_named = bool(named)
             found = named or diffed
@@ -1073,6 +1106,43 @@ class CameraSession:
             "was released; check that a card error isn't blocking the write, and "
             "that `capture_timeout_s` allows for the exposure time"
         )
+
+    def _choose_candidates(
+        self, diffed: List[str], named: List[str], expected: int
+    ) -> List[str]:
+        """Pick this capture's files out of a directory diff.
+
+        `diffed` is oldest first. With exactly `expected` candidates there is
+        nothing to choose. With more, something else is writing into
+        `capture_dir` (or a previous shot's file straggled in): anything the SDK
+        named is taken first, the rest is filled from the newest remaining, and
+        the whole line-up is logged so the ambiguity is visible rather than
+        silently resolved by whichever name sorted first.
+        """
+        if len(diffed) <= expected:
+            return diffed
+
+        chosen = [p for p in named if p in diffed][:expected]
+        for path in reversed(diffed):
+            if len(chosen) >= expected:
+                break
+            if path not in chosen:
+                chosen.append(path)
+        # Keep directory order (oldest first) so `paths` reads the same way
+        # whichever route found them.
+        chosen.sort(key=diffed.index)
+
+        names = ", ".join(os.path.basename(p) for p in diffed)
+        picked = ", ".join(os.path.basename(p) for p in chosen)
+        self._log(
+            "warning",
+            f"{len(diffed)} new files appeared in {self._config.capture_dir} for a "
+            f"capture expecting {expected} ({names}); taking "
+            f"{'the SDK-named' if named else 'the newest'}: {picked}. Something "
+            "else is writing into capture_dir - it should be exclusive to this "
+            "module",
+        )
+        return chosen
 
     def _do_set_settings(self, encoded: Dict[str, Any]) -> Dict[str, Any]:
         for key, raw in encoded.items():

@@ -69,6 +69,7 @@ class TestValidateConfig:
                 serial="SN0000001",
                 capture_dir="/tmp/sony-remote",
                 retention_max_files=200,
+                strict_capture_names=True,
                 live_view_max_fps=10,
                 connect_timeout_s=10,
                 capture_timeout_s=15,
@@ -91,6 +92,7 @@ class TestValidateConfig:
         [
             ({"capture_dir": ""}, "capture_dir"),
             ({"retention_max_files": -1}, "retention_max_files"),
+            ({"strict_capture_names": "yes"}, "strict_capture_names"),
             ({"live_view_max_fps": 0}, "live_view_max_fps"),
             ({"capture_timeout_s": -3}, "capture_timeout_s"),
             ({"connect_timeout_s": "soon"}, "connect_timeout_s"),

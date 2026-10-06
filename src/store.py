@@ -10,21 +10,53 @@ file I/O once `set_save_destination` points at it), so this module is written
 defensively: it never assumes a file it can see is complete, and never assumes
 the SDK told us the name.
 
+It also never assumes it is alone in the directory. A production machine had
+`capture_dir` shared with `color-correction`'s output directory, and a
+`DSC00432.jpg` that component exported between the pre-shutter snapshot and the
+SDK's `file_written` was returned as the capture (the real `DSC00470.ARW`
+landed unreported, and retention later deleted the other component's files).
+So a file is only ever *this module's* if it passes two filters - the extension
+the body's current file format can produce, and the camera's `DSCnnnnn.<ext>`
+naming - and retention only counts files this module itself recorded writing.
+
 All of it is blocking filesystem work and all of it runs on the session's owner
 thread.
 """
 
 import json
 import os
+import re
 import time
-from typing import Dict, List, Optional, Set
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 # Extensions the camera can write. RAW first - when a capture produces both a
 # RAW and a JPEG, the RAW is the one downstream wants (color-correction
 # demosaics it), so `primary_file` prefers it.
 RAW_EXTS = (".arw", ".raw", ".dng")
 JPEG_EXTS = (".jpg", ".jpeg")
-IMAGE_EXTS = RAW_EXTS + JPEG_EXTS + (".heif", ".heic")
+HEIF_EXTS = (".heif", ".heic")
+IMAGE_EXTS = RAW_EXTS + JPEG_EXTS + HEIF_EXTS
+
+# What each `file_format` (as `settings.py` decodes it, plus the SDK's own
+# symbolic spelling in case a body reports one we don't decode) can write. A
+# capture in "raw" can never legitimately be a .jpg, however plausible its name.
+_FORMAT_EXTS: Dict[str, Tuple[str, ...]] = {
+    "raw": RAW_EXTS,
+    "jpeg": JPEG_EXTS,
+    "jpg": JPEG_EXTS,
+    "heif": HEIF_EXTS,
+    "raw+jpeg": RAW_EXTS + JPEG_EXTS,
+    "raw_jpeg": RAW_EXTS + JPEG_EXTS,
+    "rawjpeg": RAW_EXTS + JPEG_EXTS,
+    "raw+heif": RAW_EXTS + HEIF_EXTS,
+    "raw_heif": RAW_EXTS + HEIF_EXTS,
+}
+
+# How Sony bodies name stills: DSC + five digits + extension. The optional
+# leading underscore is real - a body set to the AdobeRGB colour space writes
+# `_DSC00001.ARW` - and costs nothing against the failure this guards, which
+# is another program's file with a different shape entirely.
+CAMERA_NAME_RE = re.compile(r"^_?DSC\d{5}\.[A-Za-z0-9]+$", re.IGNORECASE)
 
 _EXT_TO_MIME = {
     ".jpg": "image/jpeg",
@@ -67,15 +99,44 @@ def is_image(name: str) -> bool:
     return name.lower().endswith(IMAGE_EXTS)
 
 
+def is_camera_name(name: str) -> bool:
+    """Whether `name` (a path or basename) is shaped like a still the body wrote."""
+    return CAMERA_NAME_RE.match(os.path.basename(name)) is not None
+
+
+def exts_for_format(file_format: Optional[str]) -> Tuple[str, ...]:
+    """Extensions a capture can produce under `file_format`.
+
+    Unknown or missing (a body whose format property we couldn't read) falls
+    back to every image type rather than refusing to shoot: the name filter
+    still applies, and a wrong format is a settings problem, not a capture one.
+    """
+    if file_format is None:
+        return IMAGE_EXTS
+    return _FORMAT_EXTS.get(str(file_format).strip().lower(), IMAGE_EXTS)
+
+
 class CaptureStore:
     """Owns one `capture_dir`."""
 
-    def __init__(self, directory: str, max_files: int = 200, logger=None):
+    def __init__(
+        self,
+        directory: str,
+        max_files: int = 200,
+        logger=None,
+        strict_names: bool = True,
+    ):
         self.directory = directory
         self.max_files = int(max_files)
+        # Whether a capture candidate must also look like `DSCnnnnn.<ext>`.
+        # Off only for a body configured with a custom file-name prefix.
+        self.strict_names = bool(strict_names)
         self._logger = logger
         self._state_path = os.path.join(directory, _STATE_FILE)
         self._capture_count = 0
+        # Basenames this module has recorded as its own captures, oldest first.
+        # Retention works from this list, never from the directory listing.
+        self._written: List[str] = []
         self._loaded = False
 
     # ------------------------------------------------------------------
@@ -92,14 +153,36 @@ class CaptureStore:
         except FileNotFoundError:
             return set()
 
-    def new_files_since(self, before: Set[str]) -> List[str]:
-        """Absolute paths of image files that appeared since `before`.
+    def accepts(self, name: str, exts: Sequence[str] = IMAGE_EXTS) -> bool:
+        """Whether `name` could be a still this body just wrote.
 
-        Newest last, by mtime. The fallback for bodies (or SDK versions) whose
-        completion notification carries no filename - see `session._capture`.
+        Two filters: the extension must be one the current file format can
+        produce (`exts_for_format`), and unless `strict_names` is off the
+        basename must be shaped like the camera's own `DSCnnnnn.<ext>`. Another
+        program's export landing in the same directory fails one or both.
+        """
+        base = os.path.basename(name)
+        if not base.lower().endswith(tuple(exts)):
+            return False
+        return not self.strict_names or is_camera_name(base)
+
+    def new_files_since(
+        self, before: Set[str], exts: Sequence[str] = IMAGE_EXTS
+    ) -> List[str]:
+        """Absolute paths of candidate stills that appeared since `before`.
+
+        Oldest first, newest last, by mtime. The fallback for bodies (or SDK
+        versions) whose completion notification carries no filename - see
+        `session._await_files`. Only files passing `accepts(name, exts)`
+        count, so a file another component dropped here mid-capture is not
+        mistaken for the shot.
         """
         try:
-            names = [n for n in os.listdir(self.directory) if is_image(n) and n not in before]
+            names = [
+                n
+                for n in os.listdir(self.directory)
+                if n not in before and self.accepts(n, exts)
+            ]
         except FileNotFoundError:
             return []
         paths = [os.path.join(self.directory, n) for n in names]
@@ -139,28 +222,63 @@ class CaptureStore:
             time.sleep(_SETTLE_INTERVAL_S)
         return 0
 
-    def prune(self) -> List[str]:
-        """Delete the oldest images beyond `max_files`. Returns what went.
+    def record_written(self, paths: Iterable[str]) -> None:
+        """Remember `paths` as captures this module produced.
 
-        Only image files are considered, so the state file and anything an
-        operator dropped in the directory survive. `max_files <= 0` disables
-        retention entirely.
+        Called once per successful capture; the basenames go into the state
+        file so retention still knows what is ours after a restart.
+        """
+        self._load_state()
+        added = False
+        for path in paths:
+            base = os.path.basename(path)
+            if base and base not in self._written:
+                self._written.append(base)
+                added = True
+        if added:
+            self._save_state()
+
+    def list_owned(self) -> List[str]:
+        """Captures this module recorded writing and that still exist, oldest
+        first. Entries whose file has gone (an operator's `rm`, a `cleanup`)
+        are dropped from the record on the way through."""
+        self._load_state()
+        present = [
+            os.path.join(self.directory, n)
+            for n in self._written
+            if os.path.exists(os.path.join(self.directory, n))
+        ]
+        if len(present) != len(self._written):
+            self._written = [os.path.basename(p) for p in present]
+            self._save_state()
+        present.sort(key=lambda p: (_safe_mtime(p), p))
+        return present
+
+    def prune(self) -> List[str]:
+        """Delete the oldest of *our* captures beyond `max_files`. Returns what went.
+
+        Only files this module recorded writing (`record_written`) are counted
+        or deleted, so the state file, anything an operator dropped in the
+        directory, and another component's output in a shared directory all
+        survive - retention must never reach past this module's own work.
+        `max_files <= 0` disables retention entirely.
         """
         if self.max_files <= 0:
             return []
-        images = self.list_images()
-        excess = len(images) - self.max_files
+        owned = self.list_owned()
+        excess = len(owned) - self.max_files
         if excess <= 0:
             return []
 
         removed = []
-        for path in images[:excess]:
+        for path in owned[:excess]:
             try:
                 os.remove(path)
                 removed.append(path)
             except OSError as exc:
                 self._log("warning", f"could not remove {path}: {exc}")
         if removed:
+            self._forget(removed)
             self._log(
                 "info",
                 f"retention: removed {len(removed)} file(s) from {self.directory} "
@@ -179,7 +297,17 @@ class CaptureStore:
                 continue
             except OSError as exc:
                 self._log("warning", f"could not remove {path}: {exc}")
+        if removed:
+            self._load_state()
+            self._forget(removed)
         return removed
+
+    def _forget(self, paths: Iterable[str]) -> None:
+        gone = {os.path.basename(p) for p in paths}
+        kept = [n for n in self._written if n not in gone]
+        if len(kept) != len(self._written):
+            self._written = kept
+            self._save_state()
 
     # ------------------------------------------------------------------
     # Shutter counter
@@ -204,8 +332,8 @@ class CaptureStore:
         """Seed the counter - e.g. from the body's own actuation count read off
         a service menu, so the number means total shutter life rather than
         life-since-this-module."""
+        self._load_state()
         self._capture_count = max(0, int(value))
-        self._loaded = True
         self._save_state()
         return self._capture_count
 
@@ -217,17 +345,38 @@ class CaptureStore:
             with open(self._state_path, "r", encoding="utf-8") as handle:
                 state = json.load(handle)
             self._capture_count = int(state.get("capture_count", 0))
+            written = state.get("written")
+            if written is None:
+                # A state file from before ownership tracking. Nothing already
+                # here is provably ours, so nothing already here is ever pruned:
+                # the operator decides what to do with it (`cleanup` empties
+                # the directory), and retention applies from this shot on.
+                self._written = []
+                legacy = len(self.list_images())
+                if legacy:
+                    self._log(
+                        "warning",
+                        f"retention: {legacy} pre-existing image(s) in "
+                        f"{self.directory} predate ownership tracking and will "
+                        "not be pruned; delete them by hand or with `cleanup` "
+                        "if they are this module's",
+                    )
+            else:
+                self._written = [str(n) for n in written if isinstance(n, str)]
         except FileNotFoundError:
             self._capture_count = 0
+            self._written = []
         except (OSError, ValueError, TypeError) as exc:
             # A corrupt state file must not stop the module from taking
             # pictures. Losing the count is bad; refusing to shoot is worse.
             self._log("warning", f"ignoring unreadable {self._state_path}: {exc}")
             self._capture_count = 0
+            self._written = []
 
     def _save_state(self) -> None:
         state: Dict[str, object] = {
             "capture_count": self._capture_count,
+            "written": list(self._written),
             "updated": time.time(),
         }
         temp = self._state_path + ".tmp"
