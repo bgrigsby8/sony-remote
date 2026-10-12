@@ -1380,9 +1380,18 @@ class CameraSession:
             value = again
         return value
 
-    def _movie_drive(self, target: int, tolerance: int) -> Tuple[int, int]:
+    def _movie_drive(
+        self, target: int, tolerance: int
+    ) -> Tuple[int, int, str, List[Tuple[int, int]]]:
         """Closed loop: nudge toward `target` until the read-back is within
-        `tolerance`. Returns (position, nudges). Must run in movie mode.
+        `tolerance`. Returns (position, nudges, stop reason, trace), the trace
+        being each nudge sent and the read-back after it. Must run in movie
+        mode.
+
+        The stop reason says which exit ended the loop: "within_tolerance",
+        "within_half_nudge", "hunting" (too many reversals), "stalled" (the
+        read-back stopped changing), "at_stop" (stalled at 0 or 65535) or
+        "budget" (`movie_max_nudges` spent).
 
         Nudge size follows the remaining distance (one size-1 nudge is about
         `movie_units_per_nudge / emulated_step_size` units). An overshoot caps
@@ -1402,15 +1411,26 @@ class CameraSession:
         pos = self._movie_read()
         nudges = stalls = reversals = 0
         cap, last_sign, last_size = 7, 0, 0
-        while abs(target - pos) > tolerance and nudges < int(self._config.movie_max_nudges):
+        trace: List[Tuple[int, int]] = []
+        while True:
             error = target - pos
+            if abs(error) <= tolerance:
+                reason = "within_tolerance"
+                break
             sign = 1 if error > 0 else -1  # positive near/far drives toward far
             if abs(error) < per_size / 2:
-                break  # a size-1 nudge would overshoot further than we are now
+                # A size-1 nudge would overshoot further than we are now.
+                reason = "within_half_nudge"
+                break
+            if nudges >= int(self._config.movie_max_nudges):
+                reason = "budget"
+                break
             if last_sign and sign != last_sign:
                 reversals += 1
                 if reversals > _FOCUS_MAX_REVERSALS:
-                    break  # hunting around a target the steps can't land in
+                    # Hunting around a target the steps can't land in.
+                    reason = "hunting"
+                    break
                 cap = max(1, last_size - 1)
             size = max(1, min(cap, round(abs(error) / per_size)))
             size = min(7, size + stalls)
@@ -1418,15 +1438,21 @@ class CameraSession:
             nudges += 1
             last_sign, last_size = sign, size
             moved_to = self._movie_read()
+            trace.append((sign * size, moved_to))
+            self._log("debug", f"focus nudge {sign * size:+d}: read back {moved_to}")
             if moved_to == pos:
                 at_stop = moved_to <= 0 if sign < 0 else moved_to >= _FOLLOW_FOCUS_MAX
                 stalls += 1
-                if at_stop or stalls > _FOCUS_MAX_STALLS:
+                if at_stop:
+                    reason = "at_stop"
+                    break
+                if stalls > _FOCUS_MAX_STALLS:
+                    reason = "stalled"
                     break
             else:
                 stalls = 0
             pos = moved_to
-        return pos, nudges
+        return pos, nudges, reason, trace
 
     def _do_set_focus_movie(self, target: int, tolerance: int) -> Dict[str, Any]:
         self._require_near_far()
@@ -1438,15 +1464,19 @@ class CameraSession:
                 f"(valid range 0..{_FOLLOW_FOCUS_MAX})",
             )
         self._movie_known = None
-        position, nudges = self._in_movie(lambda: self._movie_drive(clamped, tolerance))
+        position, nudges, reason, trace = self._in_movie(
+            lambda: self._movie_drive(clamped, tolerance)
+        )
         self._movie_known = position
         self._state_cache = None
         ok = abs(position - clamped) <= tolerance
         if not ok:
+            steps = ", ".join(f"{step:+d}->{read}" for step, read in trace) or "none"
             self._log(
                 "warning",
                 f"focus did not reach {clamped} after {nudges} nudge(s): read "
-                f"back {position} (tolerance {tolerance}). If it never moved, "
+                f"back {position} (tolerance {tolerance}), stopped: {reason}. "
+                f"Nudges (size->read-back): {steps}. If it never moved, "
                 "check that nothing is holding the focus ring.",
             )
         return {
@@ -1457,6 +1487,7 @@ class CameraSession:
             "ok": ok,
             "units": "follow_focus",
             "method": "movie",
+            "stop_reason": reason,
         }
 
     def _do_read_focus_movie(self) -> int:
