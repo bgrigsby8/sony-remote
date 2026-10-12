@@ -71,6 +71,47 @@ class TestClosedLoop:
         assert result["ok"] is True
         assert abs(follow_units(fake) - 42000) <= 200
 
+    def test_near_the_target_it_nudges_once_and_stops(self, movie_session, fake, monkeypatch):
+        session = movie_session()
+        steps = []
+        nudge = session._nudge_focus
+        monkeypatch.setattr(session, "_nudge_focus", lambda step: (steps.append(step), nudge(step)))
+        # A 50-unit window is far tighter than one size-1 nudge (262 here):
+        # the old loop hunted back and forth across it until the reversal cap.
+        for target in (42000, 41800, 30100, 52345, 10050):
+            steps.clear()
+            result = session.set_focus_position(target, tolerance=50)
+
+            assert result["attempts"] == len(steps)
+            # At most one size-1 nudge, and nothing after it.
+            singles = [i for i, s in enumerate(steps) if abs(s) == 1]
+            assert singles in ([], [len(steps) - 1]), (target, steps)
+            # Within half a size-1 step: closer than one more nudge could get.
+            assert abs(result["position"] - target) <= 262 / 2 + 1, (target, result)
+
+    def test_a_long_final_nudge_is_corrected(self, movie_session, fake, monkeypatch):
+        session = movie_session()
+        session.set_focus_position(42000, tolerance=50)
+        # From there 41800 is a single size-1 nudge away.
+        steps = []
+        nudge = session._nudge_focus
+
+        def uneven(step):
+            # Size-1 moves vary on the real lens: the first one here travels
+            # three times as far, overshooting by more than half a nudge.
+            long = abs(step) == 1 and not any(abs(s) == 1 for s in steps)
+            steps.append(step)
+            for _ in range(3 if long else 1):
+                nudge(step)
+
+        monkeypatch.setattr(session, "_nudge_focus", uneven)
+        result = session.set_focus_position(41800, tolerance=50)
+
+        singles = [s for s in steps if abs(s) == 1]
+        # The long one, then at least one back the other way.
+        assert len(singles) >= 2 and singles[1] == -singles[0], steps
+        assert abs(result["position"] - 41800) <= 262 / 2 + 1, (steps, result)
+
     def test_get_reads_the_real_position_after_an_outside_move(self, movie_session, fake):
         session = movie_session()
         session.set_focus_position(20000)

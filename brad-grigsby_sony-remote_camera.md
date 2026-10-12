@@ -58,7 +58,7 @@ Every attribute is optional.
 | `focus_on_connect` | number | — | Drive focus to this position on every connect, including reconnects after a camera power cycle (which can physically move a power-zoom lens). With emulated focus this homes first. For a rig whose stations share one focus plane, this single number replaces all other focus handling; a failure is recorded in `apply_errors`, never fatal. |
 | `focus_method` | string | `"auto"` | `"auto"`: the body's own absolute focus if it reports one, else the near/far emulation (the behaviour before this attribute existed). `"movie"`: closed loop on the lens's real position, read from the movie-mode follow-focus channel — see [Movie-mode focus](#movie-mode-focus). `"nudge"`: always the emulation. |
 | `movie_focus_fallback` | string | `"nudge"` | What `"movie"` does when movie mode can't run (no follow-focus channel, a mode switch that won't take): `"nudge"` switches to the emulation until the next connect or `home_focus`, keeping positions in follow-focus units; `"none"` fails the focus command. `"nudge"` is invalid with `focus_emulation: "off"`. |
-| `movie_focus_tolerance` | number | `400` | How close, in follow-focus units (0–65535), the read-back must land. One size-1 nudge is ~700 units on the FE PZ 16-35, so much tighter than half that can hunt. Overridable per call. |
+| `movie_focus_tolerance` | number | `400` | How close, in follow-focus units (0–65535), the read-back must land. One size-1 nudge is ~700 units on the FE PZ 16-35 and the closed loop stops within half of one, so a window narrower than one nudge (`800`) can miss by a little. Overridable per call. |
 | `movie_mode_timeout_s` | number | `5` | Longest wait for a stills↔movie switch, and for the lens to start publishing its position. |
 | `movie_units_per_nudge` | number | `2100` | Follow-focus units per nudge of `emulated_step_size`: sizes each closed-loop nudge, and converts positions under the fallback. ~2100 measured for step 3 on the FE PZ 16-35. |
 | `movie_max_nudges` | number | `60` | Nudge budget for one closed-loop move before it reports `ok: false`. |
@@ -200,7 +200,10 @@ read last in movie mode. With `focus_method: "movie"` every focus command:
    P → Movie P, …) and waits until the lens publishes its position;
 2. reads it, and for `set_focus_position` nudges near/far in a closed loop until
    the read-back is within `movie_focus_tolerance` (nudge size follows the
-   remaining distance; an overshoot steps the size down);
+   remaining distance; an overshoot steps the size down). Once the lens is
+   within half a size-1 nudge, another nudge would only land further away, so
+   it stops there rather than hunting: if the read-back is still outside the
+   tolerance, the command reports `ok: false` with where the lens actually is;
 3. switches back to the stills mode it found.
 
 Nothing is counted, so nothing homes, drifts, or needs re-homing after
