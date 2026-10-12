@@ -112,6 +112,29 @@ class TestClosedLoop:
         assert len(singles) >= 2 and singles[1] == -singles[0], steps
         assert abs(result["position"] - 41800) <= 262 / 2 + 1, (steps, result)
 
+    def test_a_landing_reports_why_it_stopped(self, movie_session, fake):
+        session = movie_session()
+        assert session.set_focus_position(30000)["stop_reason"] == "within_tolerance"
+        result = session.set_focus_position(41800, tolerance=50)
+        assert result["stop_reason"] == "within_half_nudge"
+
+    def test_a_lens_that_stops_moving_reports_the_stall(
+        self, movie_session, fake, monkeypatch, logger
+    ):
+        session = movie_session()
+        session.set_focus_position(26000)
+        # A lens resting against a stop the read-back doesn't call 0 or 65535
+        # (or a hand on the ring): nudges are accepted and nothing moves.
+        monkeypatch.setattr(session, "_nudge_focus", lambda step: None)
+        result = session.set_focus_position(35000)
+
+        assert result["ok"] is False
+        assert result["stop_reason"] == "stalled"
+        warning = logger.text("warning")
+        assert "stopped: stalled" in warning
+        # Every nudge and its read-back, so a miss explains itself.
+        assert f"+7->{result['position']}" in warning
+
     def test_get_reads_the_real_position_after_an_outside_move(self, movie_session, fake):
         session = movie_session()
         session.set_focus_position(20000)

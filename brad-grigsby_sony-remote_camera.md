@@ -246,11 +246,18 @@ retrying forever — whether that's good enough for a given station is the
 caller's call.
 
 Under `focus_method: "movie"`, `attempts` is the number of nudges and `ok` is
-an honest read-back comparison — `false` means the lens really isn't there:
+an honest read-back comparison — `false` means the lens really isn't there.
+`stop_reason` says which exit ended the closed loop: `within_tolerance`,
+`within_half_nudge` (closer than one more nudge could get), `hunting` (too
+many reversals), `stalled` (four nudges in a row didn't move the read-back —
+a lens against a stop, a hand on the ring), `at_stop` (stalled at 0 or 65535)
+or `budget` (`movie_max_nudges` spent). On a miss, the warning log also lists
+every nudge and the read-back after it:
 
 ```json
 {"position": 30112, "target": 30000, "tolerance": 400,
- "attempts": 9, "ok": true, "units": "follow_focus", "method": "movie"}
+ "attempts": 9, "ok": true, "units": "follow_focus", "method": "movie",
+ "stop_reason": "within_tolerance"}
 ```
 
 ### `focus_near_far`
