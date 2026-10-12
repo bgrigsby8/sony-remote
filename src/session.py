@@ -206,8 +206,8 @@ class SessionConfig:
     # fails the focus operation instead.
     movie_focus_fallback: str = "nudge"
     # How close (follow-focus units) the read-back must land. A size-1 nudge
-    # moves roughly 700 units on the FE PZ 16-35, so much tighter than half of
-    # that can hunt.
+    # moves roughly 700 units on the FE PZ 16-35 and the closed loop stops
+    # within half of one, so a window narrower than one nudge can miss.
     movie_focus_tolerance: int = 400
     # Longest wait for the body to finish a stills<->movie switch and for the
     # lens to start publishing its position.
@@ -1388,6 +1388,13 @@ class CameraSession:
         `movie_units_per_nudge / emulated_step_size` units). An overshoot caps
         the size below the one that overshot; a nudge the lens ignored (a
         size-1 sometimes moves nothing) earns a bigger one.
+
+        Below a size-1 nudge the loop can't refine: once the distance left is
+        under half of one, another nudge would land further away than staying
+        put, so it stops there even outside `tolerance` (chasing a narrower
+        window only hunts back and forth). A size-1 nudge that lands further
+        off than that - they vary - is corrected like any other overshoot.
+        Either way the caller judges the read-back against `tolerance`.
         """
         per_size = float(self._config.movie_units_per_nudge) / max(
             1, int(self._config.emulated_step_size)
@@ -1398,6 +1405,8 @@ class CameraSession:
         while abs(target - pos) > tolerance and nudges < int(self._config.movie_max_nudges):
             error = target - pos
             sign = 1 if error > 0 else -1  # positive near/far drives toward far
+            if abs(error) < per_size / 2:
+                break  # a size-1 nudge would overshoot further than we are now
             if last_sign and sign != last_sign:
                 reversals += 1
                 if reversals > _FOCUS_MAX_REVERSALS:
