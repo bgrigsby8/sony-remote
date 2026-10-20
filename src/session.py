@@ -145,6 +145,73 @@ _FOCUS_READ_SETTLE_MAX_S = 1.0
 _FOCUS_MAX_REVERSALS = 4
 _FOCUS_MAX_STALLS = 3
 
+# OnWarning codes (CrWarning_* / CrNotify_* in the SDK's CrError.h), so the log
+# says what happened instead of a bare hex value. Most are not problems: the
+# body uses this channel for notifications and "this list of choices changed"
+# too. The enum is sequential and new SDKs only append, so this block reads the
+# same from v1.12 on; anything past it is logged as unrecognized.
+_CAMERA_WARNINGS: Dict[int, Tuple[str, str]] = {
+    0x20000: ("CrWarning_Unknown", "the body raised an unspecified warning"),
+    0x20001: ("CrWarning_Connect_Reconnected", "the connection dropped and came back"),
+    0x20002: ("CrWarning_Connect_Reconnecting", "the connection dropped; the SDK is retrying"),
+    0x20003: ("CrWarning_File_StorageFull", "the camera's media card is full"),
+    0x20004: ("CrWarning_SetFileName_Failed", "the SDK could not apply the requested file name"),
+    0x20005: ("CrWarning_GetImage_Failed", "the SDK failed to transfer an image to the host"),
+    0x20006: ("CrWarning_FailedToSetCWB", "custom white balance capture failed"),
+    0x20007: ("CrWarning_NetworkErrorOccurred", "a network error occurred"),
+    0x20008: ("CrWarning_NetworkErrorRecovered", "the network error cleared"),
+    0x20009: ("CrWarning_Format_Failed", "formatting the media failed"),
+    0x2000A: ("CrWarning_Format_Invalid", "formatting the media is not possible now"),
+    0x2000B: ("CrWarning_Format_Complete", "formatting the media finished (informational)"),
+    0x2000C: ("CrWarning_FTPTransferSetting_Read_Result_Invalid", "FTP settings read: invalid"),
+    0x2000D: ("CrWarning_FTPTransferSetting_Read_Result_OK", "FTP settings read OK (informational)"),
+    0x2000E: ("CrWarning_FTPTransferSetting_Read_Result_NG", "FTP settings read failed"),
+    0x2000F: ("CrWarning_FTPTransferSetting_Read_Result_NG_password", "FTP settings read failed: password"),
+    0x20010: ("CrWarning_FTPTransferSetting_Read_Result_DeviceBusy", "FTP settings read failed: body busy"),
+    0x20011: ("CrNotify_Captured_Event", "the shutter fired (informational)"),
+    0x20012: ("CrWarning_DateTime_Setting_Result_Invalid", "setting the camera clock: invalid"),
+    0x20013: ("CrWarning_DateTime_Setting_Result_OK", "the camera clock was set (informational)"),
+    0x20014: ("CrWarning_DateTime_Setting_Result_Parameter_Error", "setting the camera clock: bad value"),
+    0x20015: ("CrWarning_DateTime_Setting_Result_Exclusion_Error", "setting the camera clock: not allowed now"),
+    0x20016: ("CrWarning_DateTime_Setting_Result_System_Error", "setting the camera clock: system error"),
+    0x20017: ("CrWarning_Frame_NotUpdated", "no new live-view frame since the last request"),
+    0x20018: ("CrNotify_All_Download_Complete", "all pending downloads finished (informational)"),
+    0x20019: ("CrWarning_Connect_Already", "the camera is already connected"),
+    0x2001A: ("CrWarning_Connect_OverLimitOfDevice", "too many devices are connected to the SDK"),
+    0x2001B: ("CrWarning_Format_Canceled", "formatting the media was canceled"),
+    0x2001C: ("CrWarning_ZoomAndFocusPosition_Invalid", "the saved zoom/focus position is invalid"),
+    0x2001D: ("CrWarning_ZoomAndFocusPosition_DifferentLens", "the saved zoom/focus position is for another lens"),
+    0x2001E: ("CrWarning_ZoomAndFocusPosition_InvalidLens", "the mounted lens can't recall zoom/focus positions"),
+    0x2001F: ("CrWarning_ContentsTransferMode_Invalid", "contents-transfer mode: invalid"),
+    0x20020: ("CrWarning_ContentsTransferMode_DeviceBusy", "contents-transfer mode: body busy"),
+    0x20021: ("CrWarning_ContentsTransferMode_StatusError", "contents-transfer mode: status error"),
+    0x20022: ("CrWarning_ContentsTransferMode_CanceledFromCamera", "contents transfer canceled on the body"),
+    0x20023: ("CrWarning_ContentsTransferCancel_Success", "contents transfer canceled (informational)"),
+    0x20024: ("CrWarning_ContentsTransferCancel_Error", "canceling the contents transfer failed"),
+    0x20025: ("CrNotify_ContentsTransfer_Start", "contents transfer started (informational)"),
+    0x20026: ("CrNotify_ContentsTransfer_Complete", "contents transfer finished (informational)"),
+    0x20027: ("CrWarning_CameraSettings_Read_Result_Invalid", "camera settings file read: invalid"),
+    0x20028: ("CrWarning_CameraSettings_Read_Result_OK", "camera settings file read OK (informational)"),
+    0x20029: ("CrWarning_CameraSettings_Read_Result_NG", "camera settings file read failed"),
+    0x2002A: ("CrWarning_CameraSettings_Save_Result_NG", "camera settings file save failed"),
+    0x2002B: ("CrWarning_RequestDisplayStringList_Success", "display strings fetched (informational)"),
+    0x2002C: ("CrWarning_RequestDisplayStringList_Error", "fetching display strings failed"),
+    0x2002D: ("CrWarning_DisplayListChanged_BaseLook_AELevelOffsetExposureValueList", "the base-look AE offset choices changed (informational)"),
+    0x2002E: ("CrWarning_DisplayListChanged_BaseLook_InputDisplayList", "the base-look input choices changed (informational)"),
+    0x2002F: ("CrWarning_DisplayListChanged_BaseLook_NameDisplayList", "the base-look name choices changed (informational)"),
+    0x20030: ("CrWarning_DisplayListChanged_BaseLook_OutputDisplayList", "the base-look output choices changed (informational)"),
+    0x20031: ("CrWarning_DisplayListChanged_SceneFile_NameDisplayList", "the scene-file name choices changed (informational)"),
+    0x20032: ("CrWarning_DisplayListChanged_ShootingMode_CinemaColorGamutDisplayList", "the cinema color gamut choices changed (informational)"),
+    0x20033: ("CrWarning_DisplayListChanged_ShootingMode_TargetDisplayDisplayList", "the target display choices changed (informational)"),
+    0x20034: ("CrWarning_DisplayListChanged_Camera_GainBaseISODisplayList", "the base ISO choices changed (informational)"),
+    0x20035: ("CrWarning_DisplayListChanged_Video_EIGainDisplayList", "the exposure index / gain choices changed (informational)"),
+    0x20036: ("CrWarning_DisplayListChanged_Button_AssignDisplayList", "the assignable-button choices changed (informational)"),
+    0x20037: ("CrWarning_DisplayListChanged_Button_AssignShortDisplayList", "the assignable-button short-name choices changed (informational)"),
+    0x20038: ("CrWarning_MediaProfileChanged_Slot1", "the media in slot 1 changed"),
+    0x20039: ("CrWarning_MediaProfileChanged_Slot2", "the media in slot 2 changed"),
+    0x2003A: ("CrWarning_LensInformationChanged", "the lens information changed (lens swapped?)"),
+}
+
 # Applied at connect underneath whatever the operator configured. Mechanical is
 # the default because this rig fires a strobe: the electronic shutter reads the
 # sensor progressively, so a flash lights only the rows exposed while it fired.
@@ -891,10 +958,12 @@ class CameraSession:
             return
 
         if kind == EVENT_WARNING:
-            # Body-initiated and rare; hex because that is how CrError.h reads.
+            # Body-initiated; hex because that is how CrError.h reads. Notices
+            # that report success or a changed list of choices go to debug so
+            # they don't read as faults.
             value = event.data.get("value")
-            code = f"0x{int(value):X}" if isinstance(value, (int, float)) else value
-            self._log("warning", f"camera warning: {code}")
+            level = "debug" if _camera_warning_is_informational(value) else "warning"
+            self._log(level, f"camera warning: {_describe_camera_warning(value)}")
             return
 
         self._log("debug", f"unhandled camera event {kind!r}: {event.data}")
@@ -2134,3 +2203,25 @@ def _file_size(path: str) -> int:
         return os.path.getsize(path)
     except OSError:
         return 0
+
+
+def _describe_camera_warning(value: Any) -> str:
+    """`0x20035` -> `0x20035 CrWarning_DisplayListChanged_...: what it means`."""
+    if not isinstance(value, (int, float)):
+        return str(value)
+    code = int(value)
+    known = _CAMERA_WARNINGS.get(code)
+    if known is not None:
+        name, meaning = known
+        return f"0x{code:X} {name}: {meaning}"
+    if code < 0x20000:
+        # OnError codes that aren't connection-class come through as warnings.
+        return f"0x{code:X} (SDK error, see CrError_* in CrError.h)"
+    return f"0x{code:X} (unrecognized, see CrWarning_* in CrError.h)"
+
+
+def _camera_warning_is_informational(value: Any) -> bool:
+    if not isinstance(value, (int, float)):
+        return False
+    known = _CAMERA_WARNINGS.get(int(value))
+    return known is not None and known[1].endswith("(informational)")

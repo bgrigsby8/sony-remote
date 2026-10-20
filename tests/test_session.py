@@ -105,6 +105,25 @@ class TestConnect:
         # fill with the same line.
         assert len(warnings) == 1
 
+    def test_camera_warnings_are_logged_by_name(self, session, fake, logger):
+        fake.push_event("warning", value=0x20003)
+        assert wait_until(lambda: "0x20003" in logger.text("warning"))
+        assert "CrWarning_File_StorageFull" in logger.text("warning")
+
+    def test_informational_camera_warnings_go_to_debug(self, session, fake, logger):
+        fake.push_event("warning", value=0x20035)
+        assert wait_until(lambda: "0x20035" in logger.text("debug"))
+        assert "CrWarning_DisplayListChanged_Video_EIGainDisplayList" in logger.text(
+            "debug"
+        )
+        assert "0x20035" not in logger.text("warning")
+
+    def test_unrecognized_camera_warnings_keep_the_hex_code(
+        self, session, fake, logger
+    ):
+        fake.push_event("warning", value=0x2FFFF)
+        assert wait_until(lambda: "0x2FFFF (unrecognized" in logger.text("warning"))
+
 
 class TestReconnect:
     def test_unplug_then_replug_recovers_on_its_own(self, session, fake):
