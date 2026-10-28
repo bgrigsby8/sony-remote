@@ -18,6 +18,8 @@ STILLS_M, MOVIE_M = 0x1, 0x8053
 # The fake's lens: 500 physical units of travel, 2 per unit of nudge size, so
 # one size-3 nudge is 6 physical units = 786 follow-focus units.
 UNITS_PER_NUDGE = 786
+FOLLOW_PER_PHYSICAL = 0xFFFF / 500
+LINEAR_NUDGE_UNITS = tuple(2 * size * FOLLOW_PER_PHYSICAL for size in range(1, 8))
 
 
 def follow_units(fake):
@@ -35,6 +37,11 @@ def movie_session(make_session, fake):
             emulated_step_size=3,
             movie_units_per_nudge=UNITS_PER_NUDGE,
             movie_mode_timeout_s=0.5,
+            # The linear fake lens, read back instantly.
+            movie_nudge_units=LINEAR_NUDGE_UNITS,
+            movie_max_nudge_size=7,
+            movie_read_timeout_s=0.05,
+            movie_read_stable_s=0.0,
         )
         config.update(overrides)
         session = make_session(fake, **config)
@@ -182,6 +189,125 @@ class TestClosedLoop:
         session.set_focus_position(33000)
         session.focus_near_far(-3)
         assert session.capture()["focus_position"] is None
+
+
+# The rig's lens as measured (ILCE-7RM5 + FE PZ 16-35, settled read-backs):
+# follow-focus units per nudge of size 1..7. Size 1 doesn't move it.
+MEASURED_UNITS = (0, 382, 693, 2329, 6470, 18893, 40000)
+# The same lens in the fake's physical units (500 of travel).
+MEASURED_PHYSICAL = {s: round(u / FOLLOW_PER_PHYSICAL) for s, u in enumerate(MEASURED_UNITS, 1)}
+# How late the fake publishes a move. The real body is slower (over a second);
+# what matters is that a read straight after a nudge is stale.
+LAG_S = 0.15
+
+
+@pytest.fixture
+def real_lens(movie_session, fake):
+    """A session against a fake that behaves like the rig: exponential nudge
+    sizes, and a follow-focus read-back that lags the lens."""
+
+    def build(**overrides):
+        fake.near_far_units_by_size = dict(MEASURED_PHYSICAL)
+        fake.follow_focus_latency_s = LAG_S
+        config = dict(
+            movie_nudge_units=tuple(
+                MEASURED_PHYSICAL[s] * FOLLOW_PER_PHYSICAL for s in range(1, 8)
+            ),
+            movie_max_nudge_size=6,
+            movie_read_timeout_s=4 * LAG_S,
+            movie_read_stable_s=LAG_S,
+        )
+        config.update(overrides)
+        return movie_session(**config)
+
+    return build
+
+
+class TestRealLens:
+    def test_lands_where_it_says_despite_a_lagging_read_back(
+        self, real_lens, fake, monkeypatch
+    ):
+        session = real_lens()
+        steps = []
+        nudge = session._nudge_focus
+        monkeypatch.setattr(session, "_nudge_focus", lambda s: (steps.append(s), nudge(s)))
+        for target in (30000, 59142, 41000):
+            steps.clear()
+            result = session.set_focus_position(target)
+            assert result["ok"] is True, (target, steps, result)
+            # The read-back is the lens, not a value from one nudge ago.
+            assert abs(result["position"] - follow_units(fake)) <= 1, (target, result)
+            assert abs(follow_units(fake) - target) <= 400, (target, steps)
+            # Size 1 doesn't move this lens, so it is never sent; nor is 7.
+            assert all(2 <= abs(s) <= 6 for s in steps), steps
+            assert result["stop_reason"] == "within_tolerance"
+
+    def test_the_old_two_read_rule_is_fooled_by_the_lag(self, real_lens, fake):
+        # What the rig did: trust a read-back as soon as it stops changing.
+        session = real_lens(movie_read_timeout_s=0.01, movie_read_stable_s=0.0)
+        result = session.set_focus_position(30000)
+        assert not (result["ok"] and abs(follow_units(fake) - 30000) <= 400)
+
+    def test_a_get_after_a_stills_nudge_waits_for_the_new_position(self, real_lens, fake):
+        session = real_lens()
+        session.set_focus_position(30000)
+        # Moved outside the module's knowledge: in stills, where the body
+        # doesn't publish, so the next movie session starts stale.
+        session.focus_near_far(5)
+        assert abs(session.get_focus_position() - follow_units(fake)) <= 1
+
+    def test_a_known_position_is_read_without_waiting(self, real_lens, fake, monkeypatch):
+        session = real_lens()
+        session.set_focus_position(30000)
+        waits = []
+        read = session._movie_read
+        monkeypatch.setattr(
+            session, "_movie_read", lambda previous=None: (waits.append(previous), read(previous))[1]
+        )
+        session.get_focus_position()
+        assert waits == [None]
+
+    def test_trace_records_the_late_read_back(self, real_lens, fake):
+        session = real_lens()
+        session.set_focus_position(30000)
+        before = follow_units(fake)
+        trace = session.trace_focus_read(4, 4 * LAG_S)
+
+        changes = trace["changes"]
+        assert changes[0]["position"] == before
+        assert changes[-1]["position"] == follow_units(fake) != before
+        # Published only after the lag, not at the nudge.
+        assert changes[1]["t_s"] - trace["nudge_at_s"] >= LAG_S * 0.8
+        assert fake.property_value("exposure_program_mode") == STILLS_M
+        # The trace moved the lens; nothing claims to know where it is.
+        assert session.capture()["focus_position"] is None
+
+
+class TestNudgeChoice:
+    SIZES = [(2, 382.0), (3, 693.0), (4, 2329.0), (5, 6470.0), (6, 18893.0)]
+
+    @pytest.mark.parametrize(
+        "distance,cap,size",
+        [
+            (30000, 6, 6),   # a long way: the largest that fits
+            (10000, 6, 5),
+            (2400, 6, 4),
+            (2300, 6, 3),    # 2329 would overshoot
+            (500, 6, 2),
+            (200, 6, 2),     # nothing fits: the smallest that moves
+            (30000, 3, 3),   # capped after an overshoot
+        ],
+    )
+    def test_largest_size_that_does_not_overshoot(self, distance, cap, size):
+        from session import CameraSession
+
+        assert CameraSession._pick_nudge(self.SIZES, distance, cap) == size
+
+    def test_sizes_that_do_not_move_are_never_used(self, movie_session):
+        session = movie_session(
+            movie_nudge_units=MEASURED_UNITS, movie_max_nudge_size=6
+        )
+        assert [s for s, _ in session._nudge_sizes()] == [2, 3, 4, 5, 6]
 
 
 class TestFallback:

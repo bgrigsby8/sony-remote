@@ -59,7 +59,7 @@ import crsdk_install
 import settings as settings_mod
 from binding import CameraError, make_binding
 from models.commands import CommandHandler
-from session import CameraSession, SessionConfig
+from session import _DEFAULT_MOVIE_NUDGE_UNITS, CameraSession, SessionConfig
 
 # Defaults for every optional attribute, in one place so `validate_config`,
 # `reconfigure` and the README can't drift apart.
@@ -82,6 +82,10 @@ _DEFAULTS: Dict[str, Any] = {
     "movie_focus_tolerance": 400,
     "movie_mode_timeout_s": 5.0,
     "movie_units_per_nudge": 2100.0,
+    "movie_nudge_units": list(_DEFAULT_MOVIE_NUDGE_UNITS),
+    "movie_max_nudge_size": 6,
+    "movie_read_timeout_s": 4.0,
+    "movie_read_stable_s": 1.0,
     "movie_max_nudges": 60,
     "zoom_tolerance_mm": 0.0,
     "zoom_timeout_s": 20.0,
@@ -92,6 +96,7 @@ _POSITIVE_NUMBERS = (
     "movie_mode_timeout_s",
     "movie_units_per_nudge",
     "movie_max_nudges",
+    "movie_read_timeout_s",
     "live_view_max_fps",
     "connect_timeout_s",
     "capture_timeout_s",
@@ -222,6 +227,30 @@ class Camera(CameraBase, EasyResource):
             not _is_number(movie_tolerance) or movie_tolerance < 0
         ):
             raise ValueError("`movie_focus_tolerance` must be a non-negative number")
+        nudge_units = attrs.get("movie_nudge_units")
+        if nudge_units is not None and (
+            not isinstance(nudge_units, list)
+            or len(nudge_units) != 7
+            or not all(_is_number(u) and u >= 0 for u in nudge_units)
+            or not any(u > 0 for u in nudge_units)
+        ):
+            raise ValueError(
+                "`movie_nudge_units` must be 7 non-negative numbers (follow-focus "
+                "units moved by a nudge of size 1..7), at least one above 0"
+            )
+        max_size = attrs.get("movie_max_nudge_size")
+        if max_size is not None and (not _is_number(max_size) or not 1 <= max_size <= 7):
+            raise ValueError("`movie_max_nudge_size` must be 1..7")
+        units = list(nudge_units if nudge_units is not None else _DEFAULT_MOVIE_NUDGE_UNITS)
+        limit = int(max_size if max_size is not None else _DEFAULTS["movie_max_nudge_size"])
+        if not any(u > 0 for u in units[:limit]):
+            raise ValueError(
+                f"no nudge size up to `movie_max_nudge_size` ({limit}) moves the lens "
+                "according to `movie_nudge_units`"
+            )
+        stable = attrs.get("movie_read_stable_s")
+        if stable is not None and (not _is_number(stable) or stable < 0):
+            raise ValueError("`movie_read_stable_s` must be >= 0")
         zoom_tolerance = attrs.get("zoom_tolerance_mm")
         if zoom_tolerance is not None and (
             not _is_number(zoom_tolerance) or zoom_tolerance < 0
@@ -285,6 +314,10 @@ class Camera(CameraBase, EasyResource):
             movie_focus_tolerance=int(attr("movie_focus_tolerance")),
             movie_mode_timeout_s=float(attr("movie_mode_timeout_s")),
             movie_units_per_nudge=float(attr("movie_units_per_nudge")),
+            movie_nudge_units=tuple(float(u) for u in attr("movie_nudge_units")),
+            movie_max_nudge_size=int(attr("movie_max_nudge_size")),
+            movie_read_timeout_s=float(attr("movie_read_timeout_s")),
+            movie_read_stable_s=float(attr("movie_read_stable_s")),
             movie_max_nudges=int(attr("movie_max_nudges")),
             focus_on_connect=(
                 int(attrs["focus_on_connect"])

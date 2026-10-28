@@ -105,6 +105,14 @@ class TestValidateConfig:
             ({"movie_mode_timeout_s": 0}, "movie_mode_timeout_s"),
             ({"movie_units_per_nudge": 0}, "movie_units_per_nudge"),
             ({"movie_max_nudges": 0}, "movie_max_nudges"),
+            ({"movie_nudge_units": [1, 2, 3]}, "movie_nudge_units"),
+            ({"movie_nudge_units": [0, 0, 0, 0, 0, 0, 0]}, "movie_nudge_units"),
+            ({"movie_nudge_units": [0, -1, 2, 3, 4, 5, 6]}, "movie_nudge_units"),
+            ({"movie_max_nudge_size": 8}, "movie_max_nudge_size"),
+            # Size 1 doesn't move the default lens, so a cap of 1 leaves nothing.
+            ({"movie_max_nudge_size": 1}, "movie_max_nudge_size"),
+            ({"movie_read_timeout_s": 0}, "movie_read_timeout_s"),
+            ({"movie_read_stable_s": -1}, "movie_read_stable_s"),
             ({"focus_method": "nudge", "focus_emulation": "off"}, "focus_emulation"),
             # The default fallback is the emulation that "off" forbids.
             ({"focus_method": "movie", "focus_emulation": "off"}, "movie_focus_fallback"),
@@ -355,6 +363,19 @@ class TestDispatch:
         for bad in (0, 8, -8, 1.5, "near", None):
             with pytest.raises(Exception):
                 await camera.do_command({"focus_near_far": {"step": bad}})
+
+    async def test_trace_focus_read_validates_and_reports(self, camera):
+        result = await camera.do_command(
+            {"trace_focus_read": {"step": 3, "duration_s": 0.2}}
+        )
+        assert result["step"] == 3
+        assert result["changes"][0]["t_s"] == 0.0
+        # The fake publishes at once: the nudge shows up as a change.
+        assert len(result["changes"]) == 2
+        for bad in ({"step": 8}, {"step": 1.5}, {"step": 1, "duration_s": 0},
+                    {"step": 1, "duration_s": 31}):
+            with pytest.raises(ValueError):
+                await camera.do_command({"trace_focus_read": bad})
 
     async def test_named_command_style(self, camera):
         # The webapp uses `{"command": "..."}` against other modules on the same
