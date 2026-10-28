@@ -38,7 +38,7 @@ import os
 import queue
 import threading
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from .interface import (
     EVENT_CAPTURE_COMPLETE,
@@ -162,6 +162,9 @@ class FakeCamera(CameraBinding):
         # near_far modelling: units of focus_position moved per unit of step
         # magnitude, and the travel stops the drive clamps against.
         self.near_far_units_per_step = 2
+        # Optional per-size travel {size: units} replacing the linear model -
+        # the real lens moves ~3x further per size step, and not at all for 1.
+        self.near_far_units_by_size: Optional[Dict[int, int]] = None
         self.focus_min = 0
         self.focus_max = 500
         # False models the ILCE-7RM5 over USB: the near/far drive works but
@@ -180,6 +183,12 @@ class FakeCamera(CameraBinding):
         # writable, and writes are accepted and ignored - the lens never moves.
         self.near_far_enabled = True
         self._follow_latched = 0
+        # The ILCE-7RM5 publishes a new follow-focus position late: a read in
+        # movie mode returns the previous published value until the lens has
+        # sat at its new position for this long (and a session entered after
+        # a move in stills starts with the old value too). 0 = instant.
+        self.follow_focus_latency_s = 0.0
+        self._follow_pending: Optional[Tuple[int, float]] = None
         # Zoom drive model: focal length moves `zoom_um_per_s_per_speed` per
         # second per unit of speed, clamped to the lens's range, keeps moving
         # for `zoom_coast_s` after a stop, and reads back rounded to
@@ -255,6 +264,23 @@ class FakeCamera(CameraBinding):
         span = max(1, self.focus_max - self.focus_min)
         physical = self._properties["focus_position"]["value"] - self.focus_min
         return 0xFFFF - int(round(physical * 0xFFFF / span))
+
+    def _publish_follow_focus(self) -> None:
+        """Bring the published follow-focus value up to date, after
+        `follow_focus_latency_s` (see its comment)."""
+        now_value = self.follow_focus_now()
+        if self.follow_focus_latency_s <= 0:
+            self._follow_latched = now_value
+            return
+        if now_value == self._follow_latched:
+            self._follow_pending = None
+            return
+        now = time.monotonic()
+        if self._follow_pending is None or self._follow_pending[0] != now_value:
+            self._follow_pending = (now_value, now + self.follow_focus_latency_s)
+        if now >= self._follow_pending[1]:
+            self._follow_latched = now_value
+            self._follow_pending = None
 
     def zoom_true_um(self) -> float:
         """The simulated lens's exact focal length, for assertions."""
@@ -386,7 +412,7 @@ class FakeCamera(CameraBinding):
             if not self.movie_focus_supported:
                 raise UnsupportedValueError(f"this body does not report property {name!r}")
             if self.in_movie_mode():
-                self._follow_latched = self.follow_focus_now()
+                self._publish_follow_focus()
             value = self._follow_latched
         writable = bool(prop.get("writable", True))
         if name == "near_far":
@@ -441,7 +467,7 @@ class FakeCamera(CameraBinding):
         elif name == "exposure_program_mode":
             if self.mode_switch_works:
                 if self.in_movie_mode() and self.movie_focus_supported:
-                    self._follow_latched = self.follow_focus_now()
+                    self._publish_follow_focus()
                 prop["value"] = value
         elif name == "near_far" and not self.near_far_enabled:
             # Accepted and ignored, exactly like the body with the lens's
@@ -452,9 +478,12 @@ class FakeCamera(CameraBinding):
             # focus by `near_far_units_per_step` per unit of magnitude, clamped
             # to the travel range like a real lens hitting its stops.
             step = value - 0x10000 if value > 0x7FFF else value
-            moved = self._properties["focus_position"]["value"] + (
-                step * self.near_far_units_per_step
-            )
+            if self.near_far_units_by_size is not None:
+                travel = self.near_far_units_by_size.get(abs(step), 0)
+                delta = travel if step > 0 else -travel
+            else:
+                delta = step * self.near_far_units_per_step
+            moved = self._properties["focus_position"]["value"] + delta
             self._properties["focus_position"]["value"] = max(
                 self.focus_min, min(self.focus_max, moved)
             )

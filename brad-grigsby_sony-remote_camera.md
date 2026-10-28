@@ -58,9 +58,13 @@ Every attribute is optional.
 | `focus_on_connect` | number | — | Drive focus to this position on every connect, including reconnects after a camera power cycle (which can physically move a power-zoom lens). With emulated focus this homes first. For a rig whose stations share one focus plane, this single number replaces all other focus handling; a failure is recorded in `apply_errors`, never fatal. |
 | `focus_method` | string | `"auto"` | `"auto"`: the body's own absolute focus if it reports one, else the near/far emulation (the behaviour before this attribute existed). `"movie"`: closed loop on the lens's real position, read from the movie-mode follow-focus channel — see [Movie-mode focus](#movie-mode-focus). `"nudge"`: always the emulation. |
 | `movie_focus_fallback` | string | `"nudge"` | What `"movie"` does when movie mode can't run (no follow-focus channel, a mode switch that won't take): `"nudge"` switches to the emulation until the next connect or `home_focus`, keeping positions in follow-focus units; `"none"` fails the focus command. `"nudge"` is invalid with `focus_emulation: "off"`. |
-| `movie_focus_tolerance` | number | `400` | How close, in follow-focus units (0–65535), the read-back must land. One size-1 nudge is ~700 units on the FE PZ 16-35 and the closed loop stops within half of one, so a window narrower than one nudge (`800`) can miss by a little. Overridable per call. |
+| `movie_focus_tolerance` | number | `400` | How close, in follow-focus units (0–65535), the read-back must land. The smallest nudge that moves the FE PZ 16-35 (size 2) is ~380 units and the closed loop stops within half of one, so a window much narrower than that can miss by a little. Overridable per call. |
 | `movie_mode_timeout_s` | number | `5` | Longest wait for a stills↔movie switch, and for the lens to start publishing its position. |
-| `movie_units_per_nudge` | number | `2100` | Follow-focus units per nudge of `emulated_step_size`: sizes each closed-loop nudge, and converts positions under the fallback. ~2100 measured for step 3 on the FE PZ 16-35. |
+| `movie_nudge_units` | list | `[0, 382, 693, 2329, 6470, 18893, 40000]` | Follow-focus units one nudge of each size 1–7 moves the lens: the closed loop sends the largest size that won't overshoot. Defaults measured on the FE PZ 16-35 (2026-10-27). Size 1 doesn't move that lens, and a size listed as `0` is never used. Measure another lens with `focus_near_far` followed by two `get_focus_position` calls (the first is stale; see [Movie-mode focus](#movie-mode-focus)). |
+| `movie_max_nudge_size` | number | `6` | Largest nudge size the closed loop sends. Size 7 can run the lens for seconds, into a stop. |
+| `movie_read_timeout_s` | number | `4` | After a nudge, how long a read waits for the body to publish the move. |
+| `movie_read_stable_s` | number | `1` | How long the published position must hold still before it is trusted (a long move publishes intermediate positions). |
+| `movie_units_per_nudge` | number | `2100` | Follow-focus units per nudge of `emulated_step_size`, used only to convert positions under the nudge fallback. |
 | `movie_max_nudges` | number | `60` | Nudge budget for one closed-loop move before it reports `ok: false`. |
 
 `apply_on_connect` values are validated all the way down to their raw SDK
@@ -199,12 +203,25 @@ read last in movie mode. With `focus_method: "movie"` every focus command:
 1. switches the body to the movie counterpart of its stills mode (M → Movie M,
    P → Movie P, …) and waits until the lens publishes its position;
 2. reads it, and for `set_focus_position` nudges near/far in a closed loop until
-   the read-back is within `movie_focus_tolerance` (nudge size follows the
-   remaining distance; an overshoot steps the size down). Once the lens is
-   within half a size-1 nudge, another nudge would only land further away, so
-   it stops there rather than hunting: if the read-back is still outside the
-   tolerance, the command reports `ok: false` with where the lens actually is;
+   the read-back is within `movie_focus_tolerance` (each nudge is the largest
+   size in `movie_nudge_units` that won't overshoot; an overshoot steps the
+   size down). Once the lens is within half the smallest nudge, another would
+   only land further away, so it stops there rather than hunting: if the
+   read-back is still outside the tolerance, the command reports `ok: false`
+   with where the lens actually is;
 3. switches back to the stills mode it found.
+
+**The read-back is late.** The body publishes a new position well after the
+lens gets there (over a second, measured on the rig): a read straight after a
+nudge, and the first read of a movie session after the lens moved in stills,
+both return the old position. So after a nudge every read waits for the value
+to change (`movie_read_timeout_s`) and then to hold still
+(`movie_read_stable_s`). When the module doesn't know where the lens is (after
+a stills nudge, autofocus, a zoom or a reconnect), the first read of a session
+waits for the update too. Before this, the loop trusted the first two reads
+that agreed, chased a position one nudge behind the lens, and hunted.
+[`trace_focus_read`](#trace_focus_read) records the read-back over time, to
+tune those waits.
 
 Nothing is counted, so nothing homes, drifts, or needs re-homing after
 autofocus, zoom or a reconnect: a hand on the focus ring shows up in the next
@@ -271,6 +288,25 @@ One raw relative focus nudge: sign is direction (negative = near), magnitude
 focus — count how many `step: 7` nudges cross your lens's travel to size
 `emulated_travel_nudges`. A manual nudge invalidates the emulated position
 count until the next focus operation re-homes.
+
+### `trace_focus_read`
+
+```json
+{"trace_focus_read": {"step": 4, "duration_s": 6}}
+->  {"step": 4, "duration_s": 6, "nudge_at_s": 0.0,
+     "changes": [{"t_s": 0.0, "position": 33698},
+                 {"t_s": 1.42, "position": 36027}]}
+```
+
+(The timing above is illustrative, not measured.) Diagnostic for movie-mode
+focus: switches to movie mode, sends one nudge of
+`step` (0 or absent: none), and records every change of the published
+follow-focus position for `duration_s` (default 6, max 30), then switches back.
+The delay between `nudge_at_s` and the first change is the read-back's lag,
+and the spacing of later changes shows how a long move is published. That's
+what `movie_read_timeout_s` and `movie_read_stable_s` should be set from. With
+`step: 0` it shows how long the first read of a session stays stale. Moves
+the lens and leaves it there.
 
 ### `home_focus`
 

@@ -59,6 +59,7 @@ _FLAT = (
     "set_focus_position",
     "autofocus_once",
     "focus_near_far",
+    "trace_focus_read",
     "home_focus",
     "get_zoom",
     "set_zoom",
@@ -271,6 +272,22 @@ class CommandHandler:
         if step == 0 or not -7 <= step <= 7:
             raise ValueError(f"`step` must be -7..7 and non-zero, got {step}")
         return await _to_thread(self._session.focus_near_far, step)
+
+    async def _cmd_trace_focus_read(self, opts: Mapping[str, Any]) -> Dict[str, ValueTypes]:
+        """Diagnostic: every change of the movie-mode follow-focus read-back
+        over `duration_s` (default 6, max 30) after one nudge of `step`
+        (-7..7; 0 or absent = no nudge). Moves the lens; leaves it there."""
+        step = opts.get("step", 0)
+        if isinstance(step, bool) or not isinstance(step, (int, float)) or int(step) != step:
+            raise ValueError("`trace_focus_read` needs an integer `step` (-7..7)")
+        step = int(step)
+        if not -7 <= step <= 7:
+            raise ValueError(f"`step` must be -7..7, got {step}")
+        duration = _optional_number(opts.get("duration_s"))
+        duration = 6.0 if duration is None else duration
+        if not 0 < duration <= 30:
+            raise ValueError(f"`duration_s` must be in (0, 30], got {duration}")
+        return await _to_thread(self._session.trace_focus_read, step, duration)
 
     async def _cmd_home_focus(self, opts: Mapping[str, Any]) -> Dict[str, ValueTypes]:
         """Re-zero emulated focus against the lens's near stop.
