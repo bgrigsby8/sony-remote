@@ -102,6 +102,7 @@ class TestValidateConfig:
             ({"focus_method": "follow"}, "focus_method"),
             ({"focus_method": "movie", "movie_focus_fallback": "af"}, "movie_focus_fallback"),
             ({"movie_focus_tolerance": -1}, "movie_focus_tolerance"),
+            ({"movie_focus_accept_tolerance": -1}, "movie_focus_accept_tolerance"),
             ({"movie_mode_timeout_s": 0}, "movie_mode_timeout_s"),
             ({"movie_units_per_nudge": 0}, "movie_units_per_nudge"),
             ({"movie_max_nudges": 0}, "movie_max_nudges"),
@@ -290,6 +291,17 @@ class TestNewCommands:
         assert result["ok"] is True
 
         assert (await camera.do_command({"get_focus_position": {}}))["position"] == 240
+
+    async def test_set_focus_position_passes_the_accept_tolerance(self, camera, monkeypatch):
+        calls = []
+        monkeypatch.setattr(
+            camera._session, "set_focus_position", lambda *args: calls.append(args) or {}
+        )
+        await camera.do_command(
+            {"set_focus_position": {"position": 40000, "tolerance": 400, "accept_tolerance": 900}}
+        )
+        await camera.do_command({"set_focus_position": {"position": 40000}})
+        assert calls == [(40000, 400, 900), (40000, None, None)]
 
     async def test_set_focus_position_needs_an_integer(self, camera):
         with pytest.raises(ValueError, match="position"):

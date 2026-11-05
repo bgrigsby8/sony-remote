@@ -227,6 +227,11 @@ class Camera(CameraBase, EasyResource):
             not _is_number(movie_tolerance) or movie_tolerance < 0
         ):
             raise ValueError("`movie_focus_tolerance` must be a non-negative number")
+        accept_tolerance = attrs.get("movie_focus_accept_tolerance")
+        if accept_tolerance is not None and (
+            not _is_number(accept_tolerance) or accept_tolerance < 0
+        ):
+            raise ValueError("`movie_focus_accept_tolerance` must be a non-negative number")
         nudge_units = attrs.get("movie_nudge_units")
         if nudge_units is not None and (
             not isinstance(nudge_units, list)
@@ -312,6 +317,12 @@ class Camera(CameraBase, EasyResource):
             focus_method=str(attr("focus_method")),
             movie_focus_fallback=str(attr("movie_focus_fallback")),
             movie_focus_tolerance=int(attr("movie_focus_tolerance")),
+            # Unset = _DEFAULT_FOCUS_ACCEPT_FACTOR x the tolerance in force.
+            movie_focus_accept_tolerance=(
+                int(attrs["movie_focus_accept_tolerance"])
+                if attrs.get("movie_focus_accept_tolerance") is not None
+                else None
+            ),
             movie_mode_timeout_s=float(attr("movie_mode_timeout_s")),
             movie_units_per_nudge=float(attr("movie_units_per_nudge")),
             movie_nudge_units=tuple(float(u) for u in attr("movie_nudge_units")),

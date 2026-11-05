@@ -59,6 +59,7 @@ Every attribute is optional.
 | `focus_method` | string | `"auto"` | `"auto"`: the body's own absolute focus if it reports one, else the near/far emulation (the behaviour before this attribute existed). `"movie"`: closed loop on the lens's real position, read from the movie-mode follow-focus channel — see [Movie-mode focus](#movie-mode-focus). `"nudge"`: always the emulation. |
 | `movie_focus_fallback` | string | `"nudge"` | What `"movie"` does when movie mode can't run (no follow-focus channel, a mode switch that won't take): `"nudge"` switches to the emulation until the next connect or `home_focus`, keeping positions in follow-focus units; `"none"` fails the focus command. `"nudge"` is invalid with `focus_emulation: "off"`. |
 | `movie_focus_tolerance` | number | `400` | How close, in follow-focus units (0–65535), the read-back must land. The smallest nudge that moves the FE PZ 16-35 (size 2) is ~380 units and the closed loop stops within half of one, so a window much narrower than that can miss by a little. Overridable per call. |
+| `movie_focus_accept_tolerance` | number | 2 × tolerance | Near-miss window, in follow-focus units. A read-back outside `movie_focus_tolerance` but within this returns `ok: true` with `near_miss: true` and a `warning`, so the caller can shoot and flag the frame. Unset = 2 × the tolerance in force (provisional, CONSULT-2297). Never narrower than the tolerance. Overridable per call (`accept_tolerance`). |
 | `movie_mode_timeout_s` | number | `5` | Longest wait for a stills↔movie switch, and for the lens to start publishing its position. |
 | `movie_nudge_units` | list | `[0, 382, 693, 2329, 6470, 18893, 40000]` | Follow-focus units one nudge of each size 1–7 moves the lens: the closed loop sends the largest size that won't overshoot. Defaults measured on the FE PZ 16-35 (2026-10-27). Size 1 doesn't move that lens, and a size listed as `0` is never used. Measure another lens with `focus_near_far` followed by two `get_focus_position` calls (the first is stale; see [Movie-mode focus](#movie-mode-focus)). |
 | `movie_max_nudge_size` | number | `6` | Largest nudge size the closed loop sends. Size 7 can run the lens for seconds, into a stop. |
@@ -205,9 +206,14 @@ read last in movie mode. With `focus_method: "movie"` every focus command:
 2. reads it, and for `set_focus_position` nudges near/far in a closed loop until
    the read-back is within `movie_focus_tolerance` (each nudge is the largest
    size in `movie_nudge_units` that won't overshoot; an overshoot steps the
-   size down). Once the lens is within half the smallest nudge, another would
-   only land further away, so it stops there rather than hunting: if the
-   read-back is still outside the tolerance, the command reports `ok: false`
+   size down). The table is only the starting guess: every read-back updates
+   how far each size really moves during that move, because at some zooms a
+   nudge runs several times the table (CONSULT-2297). Once the lens is within
+   half the smallest nudge (as measured), another would only land further
+   away, so it stops there rather than hunting. If it still goes back and
+   forth across the target, it stops at the closer of the two positions. A
+   read-back outside the tolerance but inside `movie_focus_accept_tolerance`
+   is a near miss (`ok: true` with a `warning`); further off is `ok: false`
    with where the lens actually is;
 3. switches back to the stills mode it found.
 
@@ -265,17 +271,25 @@ caller's call.
 Under `focus_method: "movie"`, `attempts` is the number of nudges and `ok` is
 an honest read-back comparison — `false` means the lens really isn't there.
 `stop_reason` says which exit ended the closed loop: `within_tolerance`,
-`within_half_nudge` (closer than one more nudge could get), `hunting` (too
-many reversals), `stalled` (four nudges in a row didn't move the read-back —
+`within_half_nudge` (closer than one more nudge could get), `hunting` (back
+and forth across the target, or too many reversals; it ends at the closer of
+the last two positions), `stalled` (four nudges in a row didn't move the read-back —
 a lens against a stop, a hand on the ring), `at_stop` (stalled at 0 or 65535)
 or `budget` (`movie_max_nudges` spent). On a miss, the warning log also lists
 every nudge and the read-back after it:
 
 ```json
-{"position": 30112, "target": 30000, "tolerance": 400,
+{"position": 30112, "target": 30000, "tolerance": 400, "accept_tolerance": 800,
+ "miss": 112, "near_miss": false,
  "attempts": 9, "ok": true, "units": "follow_focus", "method": "movie",
  "stop_reason": "within_tolerance"}
 ```
+
+`miss` is how far the read-back is from the target. A read-back outside
+`tolerance` but within `accept_tolerance` (per call, else
+`movie_focus_accept_tolerance`, else 2 × `tolerance`) comes back as
+`"ok": true, "near_miss": true` plus a `warning` string, e.g.
+`{"set_focus_position": {"position": 40000, "accept_tolerance": 1000}}`.
 
 ### `focus_near_far`
 
