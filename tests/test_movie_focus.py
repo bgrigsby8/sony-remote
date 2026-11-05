@@ -662,6 +662,94 @@ class TestAcceptByZoom:
         assert session.set_focus_position(40000)["accept_tolerance"] == 1000
 
 
+# The rig's own failing cycle (2026-11-05 logs, all 13 shoes failures): at
+# 16mm, target 40000. Whether a shoes drive failed depended only on where the
+# previous outfits drive left the lens. From 58849 the error (18849) was just
+# under the flat table's size 6 (18893), so it sent size 5 and hunted; from
+# 59134 it sent size 6, hit the near stop, and landed. The read-backs were
+# fully repeatable; these are every 16mm transition the logs saw.
+RIG_16MM_LOG = {
+    (58849, -5): 28529, (28529, +4): 38465, (38465, +3): 42542,
+    (42542, -2): 40999, (40999, -2): 39366, (39366, +2): 40999,
+    (59134, -6): 0, (0, +5): 18019, (18019, +5): 42304,
+    (42304, -3): 38183, (38183, +2): 39920,
+    (63482, -4): 50131, (50131, -4): 38465, (42775, -2): 41264, (41264, -2): 39625,
+}
+RIG_HUNT = [28529, 38465, 42542, 40999, 39366, 40999]
+RIG_LANDING = [0, 18019, 42304, 38183, 39920]
+
+
+class RigLog16mm:
+    """The 16mm lens from the rig's logs: the logged transitions exactly, and
+    off that path moves that grow with the start position as the logs show
+    (size 5: 18019 from 0, 24285 from 18019; size 4: 9936 / 11666 / 13351
+    from 28.5k / 50k / 63k; size 3 4077-4310; size 2 1511-1737). Size 6 runs
+    into a stop from anywhere in the range."""
+
+    def __init__(self, start):
+        self.pos = start
+        self.steps = []
+        self.path = [start]
+
+    @staticmethod
+    def travel(size, at):
+        if size == 5:
+            return 18019 + (24285 - 18019) / 18019 * at
+        if size == 4:
+            return 9936 + (11666 - 9936) / (50131 - 28529) * (at - 28529)
+        if size >= 6:
+            return 0xFFFF
+        base = {1: 0, 2: 1640, 3: 4170}[size]
+        return base * (1 + 9e-6 * (at - 40000))
+
+    def nudge(self, step):
+        self.steps.append(step)
+        to = RIG_16MM_LOG.get((self.pos, step))
+        if to is None:
+            to = round(self.pos + (1 if step > 0 else -1) * self.travel(abs(step), self.pos))
+        self.pos = max(0, min(0xFFFF, to))
+        self.path.append(self.pos)
+
+    def install(self, session, monkeypatch):
+        monkeypatch.setattr(session, "_nudge_focus", self.nudge)
+        monkeypatch.setattr(session, "_movie_read_once", lambda: self.pos)
+        return self
+
+
+class TestRigFailingCycle:
+    @pytest.mark.parametrize("start,path", [(58849, RIG_HUNT), (59134, RIG_LANDING)])
+    def test_the_old_flat_table_reproduces_the_log(
+        self, movie_session, fake, monkeypatch, start, path
+    ):
+        # 0.3.0's view: the flat table, nothing learned during the move.
+        session = movie_session(movie_nudge_units=MEASURED_UNITS, movie_max_nudge_size=6)
+        fake._zoom_um = 16000.0
+        monkeypatch.setattr(
+            session, "_learned_sizes", lambda sizes, seen: (list(sizes), sizes[0][1])
+        )
+        lens = RigLog16mm(start).install(session, monkeypatch)
+        result = session.set_focus_position(40000)
+        assert lens.path[1 : len(path) + 1] == path, lens.path
+        if start == 58849:
+            # It hunts 40999 <-> 39366; 0.3.0 failed here at 40999.
+            assert result["stop_reason"] == "hunting"
+        else:
+            assert result["stop_reason"] == "within_tolerance"
+
+    @pytest.mark.parametrize("start", [58849, 59134])
+    def test_the_new_loop_lands_from_both_outfits_end_points(
+        self, zoomed, monkeypatch, start
+    ):
+        session = zoomed(16)
+        lens = RigLog16mm(start).install(session, monkeypatch)
+        result = session.set_focus_position(40000)
+
+        assert result["ok"] is True, (lens.path, result)
+        assert result["stop_reason"] != "hunting", (lens.path, result)
+        assert result["miss"] <= 1000, (lens.path, result)
+        assert result["near_miss"] == (result["miss"] > 400)
+
+
 class TestFallback:
     def test_no_follow_focus_falls_back_to_the_emulation(self, movie_session, fake, logger):
         fake.movie_focus_supported = False
