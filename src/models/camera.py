@@ -59,7 +59,13 @@ import crsdk_install
 import settings as settings_mod
 from binding import CameraError, make_binding
 from models.commands import CommandHandler
-from session import _DEFAULT_MOVIE_NUDGE_UNITS, CameraSession, SessionConfig
+from session import (
+    _DEFAULT_FOCUS_ACCEPT_BY_ZOOM,
+    _DEFAULT_MOVIE_NUDGE_UNITS,
+    _DEFAULT_MOVIE_NUDGE_UNITS_BY_ZOOM,
+    CameraSession,
+    SessionConfig,
+)
 
 # Defaults for every optional attribute, in one place so `validate_config`,
 # `reconfigure` and the README can't drift apart.
@@ -83,6 +89,10 @@ _DEFAULTS: Dict[str, Any] = {
     "movie_mode_timeout_s": 5.0,
     "movie_units_per_nudge": 2100.0,
     "movie_nudge_units": list(_DEFAULT_MOVIE_NUDGE_UNITS),
+    # Keys are focal lengths in mm, as strings (a config struct's keys are).
+    "movie_nudge_units_by_zoom": {
+        f"{mm:g}": list(units) for mm, units in _DEFAULT_MOVIE_NUDGE_UNITS_BY_ZOOM.items()
+    },
     "movie_max_nudge_size": 6,
     "movie_read_timeout_s": 4.0,
     "movie_read_stable_s": 1.0,
@@ -105,6 +115,17 @@ _POSITIVE_NUMBERS = (
     "zoom_max_drive_s",
 )
 
+
+def _nudge_units_by_zoom(attrs: Mapping[str, Any]) -> Dict[float, Tuple[float, ...]]:
+    """`movie_nudge_units_by_zoom` as {mm: units}. A config that sets its own
+    flat `movie_nudge_units` (another lens) and no per-zoom tables gets none:
+    the built-in ones describe the FE PZ 16-35 and would override it."""
+    tables = attrs.get("movie_nudge_units_by_zoom")
+    if tables is None:
+        if attrs.get("movie_nudge_units") is not None:
+            return {}
+        tables = _DEFAULTS["movie_nudge_units_by_zoom"]
+    return {float(mm): tuple(float(u) for u in units) for mm, units in tables.items()}
 
 class Camera(CameraBase, EasyResource):
     # To enable debug-level logging, either run viam-server with the --debug
@@ -227,6 +248,11 @@ class Camera(CameraBase, EasyResource):
             not _is_number(movie_tolerance) or movie_tolerance < 0
         ):
             raise ValueError("`movie_focus_tolerance` must be a non-negative number")
+        accept_tolerance = attrs.get("movie_focus_accept_tolerance")
+        if accept_tolerance is not None and (
+            not _is_number(accept_tolerance) or accept_tolerance < 0
+        ):
+            raise ValueError("`movie_focus_accept_tolerance` must be a non-negative number")
         nudge_units = attrs.get("movie_nudge_units")
         if nudge_units is not None and (
             not isinstance(nudge_units, list)
@@ -248,6 +274,32 @@ class Camera(CameraBase, EasyResource):
                 f"no nudge size up to `movie_max_nudge_size` ({limit}) moves the lens "
                 "according to `movie_nudge_units`"
             )
+        by_zoom = attrs.get("movie_nudge_units_by_zoom")
+        if by_zoom is not None:
+            if not isinstance(by_zoom, dict):
+                raise ValueError(
+                    "`movie_nudge_units_by_zoom` must be an object of focal length "
+                    '(mm) -> 7 units, e.g. {"16": [...], "35": [...]}'
+                )
+            for key, table in by_zoom.items():
+                try:
+                    mm = float(key)
+                except (TypeError, ValueError):
+                    mm = 0.0
+                if not mm > 0:
+                    raise ValueError(
+                        f"`movie_nudge_units_by_zoom` key {key!r} must be a focal length in mm (> 0)"
+                    )
+                if (
+                    not isinstance(table, list)
+                    or len(table) != 7
+                    or not all(_is_number(u) and u >= 0 for u in table)
+                    or not any(u > 0 for u in table[:limit])
+                ):
+                    raise ValueError(
+                        f"`movie_nudge_units_by_zoom[{key!r}]` must be 7 non-negative numbers "
+                        f"with a size up to `movie_max_nudge_size` ({limit}) above 0"
+                    )
         stable = attrs.get("movie_read_stable_s")
         if stable is not None and (not _is_number(stable) or stable < 0):
             raise ValueError("`movie_read_stable_s` must be >= 0")
@@ -312,9 +364,24 @@ class Camera(CameraBase, EasyResource):
             focus_method=str(attr("focus_method")),
             movie_focus_fallback=str(attr("movie_focus_fallback")),
             movie_focus_tolerance=int(attr("movie_focus_tolerance")),
+            # Unset = _DEFAULT_FOCUS_ACCEPT_FACTOR x the tolerance in force.
+            movie_focus_accept_tolerance=(
+                int(attrs["movie_focus_accept_tolerance"])
+                if attrs.get("movie_focus_accept_tolerance") is not None
+                else None
+            ),
             movie_mode_timeout_s=float(attr("movie_mode_timeout_s")),
             movie_units_per_nudge=float(attr("movie_units_per_nudge")),
             movie_nudge_units=tuple(float(u) for u in attr("movie_nudge_units")),
+            movie_nudge_units_by_zoom=_nudge_units_by_zoom(attrs),
+            # The built-in per-zoom near-miss windows (16mm: 1000) belong to
+            # the built-in tables: a config with its own tables doesn't get them.
+            movie_focus_accept_by_zoom=(
+                dict(_DEFAULT_FOCUS_ACCEPT_BY_ZOOM)
+                if attrs.get("movie_nudge_units_by_zoom") is None
+                and attrs.get("movie_nudge_units") is None
+                else {}
+            ),
             movie_max_nudge_size=int(attr("movie_max_nudge_size")),
             movie_read_timeout_s=float(attr("movie_read_timeout_s")),
             movie_read_stable_s=float(attr("movie_read_stable_s")),

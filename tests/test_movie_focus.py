@@ -8,6 +8,8 @@ tests run that against the fake's physical model: positions in follow-focus
 units, 0 = near stop .. 65535 = far stop.
 """
 
+import math
+
 import pytest
 
 from binding import ConfigurationError, SDKError
@@ -308,6 +310,444 @@ class TestNudgeChoice:
             movie_nudge_units=MEASURED_UNITS, movie_max_nudge_size=6
         )
         assert [s for s, _ in session._nudge_sizes()] == [2, 3, 4, 5, 6]
+
+
+# CONSULT-2297, Nines-Photographer 2026-11-05: a shoes sweep asked for 40000
+# (tolerance 400) and the lens hunted. Every nudge size ran ~4x the table
+# (size 2: ~1600 units, not 382), so "within half a nudge" never fired and
+# the loop flipped across the target until the reversal cap. The sony log:
+#   Nudges: -5->28529, +4->38465, +3->42542, -2->40999, -2->39366, +2->40999, -2->39366
+# and the webapp's retry from there:
+#   Nudges: +2->40999, -2->39366, +2->40999, -2->39366, +2->40999  (failed at 40999)
+TICKET_TARGET = 40000
+TICKET_TRACE = [
+    (-5, 28529), (+4, 38465), (+3, 42542), (-2, 40999), (-2, 39366), (+2, 40999), (-2, 39366),
+]
+TICKET_RETRY_START = 39366
+TICKET_RETRY_TRACE = [(+2, 40999), (-2, 39366), (+2, 40999), (-2, 39366), (+2, 40999)]
+# Where the first move started: where a size-5 nudge 4x the table (25880)
+# lands on 28529. (The log doesn't say; any start that picks size 5 first
+# replays the same nudges.)
+TICKET_START = 28529 + 4 * 6470
+# What one nudge of each size moved in that trace; size 6 wasn't sent, so 4x.
+TICKET_UNITS = {2: 1633, 3: 4077, 4: 9936, 5: 25880, 6: 4 * 18893}
+
+
+class TicketLens:
+    """The rig's lens as it behaved in the ticket: every read-back in the two
+    traces above, exactly, and the trace's per-size travel anywhere else.
+    Read back instantly (the lag has its own tests above)."""
+
+    def __init__(self, start, units=TICKET_UNITS):
+        self.pos = start
+        self.units = units
+        self.steps = []
+        self.path = [start]
+        self.jumps = {}
+        for first, trace in ((TICKET_START, TICKET_TRACE), (TICKET_RETRY_START, TICKET_RETRY_TRACE)):
+            at = first
+            for step, read in trace:
+                assert self.jumps.setdefault((at, step), read) == read
+                at = read
+
+    def nudge(self, step):
+        self.steps.append(step)
+        sign = 1 if step > 0 else -1
+        to = self.jumps.get((self.pos, step), self.pos + sign * self.units.get(abs(step), 0))
+        self.pos = max(0, min(0xFFFF, to))
+        self.path.append(self.pos)
+
+    def install(self, session, monkeypatch):
+        monkeypatch.setattr(session, "_nudge_focus", self.nudge)
+        monkeypatch.setattr(session, "_movie_read_once", lambda: self.pos)
+        return self
+
+
+@pytest.fixture
+def ticket_lens(movie_session, monkeypatch):
+    """A session configured like the rig (the 2026-10-27 table, sizes 2-6,
+    tolerance 400) driving a `TicketLens`."""
+
+    def build(start, **overrides):
+        config = dict(movie_nudge_units=MEASURED_UNITS, movie_max_nudge_size=6)
+        config.update(overrides)
+        session = movie_session(**config)
+        return session, TicketLens(start).install(session, monkeypatch)
+
+    return build
+
+
+def closer_of_last_two(lens, target):
+    """Whether the lens ended at the closer of its last two positions."""
+    if len(lens.path) < 2:
+        return True
+    return abs(target - lens.path[-1]) <= abs(target - lens.path[-2])
+
+
+class TestLongNudges:
+    """CONSULT-2297: nudges far longer than `movie_nudge_units` says."""
+
+    def test_the_fixture_lens_runs_about_4x_the_table(self):
+        for size, units in TICKET_UNITS.items():
+            assert 3.5 <= units / MEASURED_UNITS[size - 1] <= 6.5, size
+        # And it replays the ticket's traces exactly.
+        for start, trace in ((TICKET_START, TICKET_TRACE), (TICKET_RETRY_START, TICKET_RETRY_TRACE)):
+            lens = TicketLens(start)
+            for step, read in trace:
+                lens.nudge(step)
+                assert lens.pos == read
+
+    @pytest.mark.parametrize("start", [TICKET_START, TICKET_RETRY_START, 40999])
+    def test_the_ticket_move_no_longer_fails_by_hunting(self, ticket_lens, start, logger):
+        session, lens = ticket_lens(start)
+        result = session.set_focus_position(TICKET_TARGET)
+
+        assert result["ok"] is True, (lens.steps, result)
+        assert result["stop_reason"] != "hunting", (lens.steps, result)
+        assert result["position"] == lens.pos
+        miss = abs(lens.pos - TICKET_TARGET)
+        assert miss <= 400 or closer_of_last_two(lens, TICKET_TARGET), (lens.steps, result)
+        assert result["miss"] == miss
+        if miss > 400:
+            # Outside the tolerance: accepted, but said so.
+            assert result["near_miss"] is True
+            assert str(miss) in result["warning"]
+            assert "near miss" in logger.text("warning")
+        else:
+            assert result["near_miss"] is False
+            assert "warning" not in result
+
+    def test_the_first_ticket_move_learns_the_long_step_and_stops(self, ticket_lens):
+        session, lens = ticket_lens(TICKET_START)
+        result = session.set_focus_position(TICKET_TARGET)
+        # Fewer nudges than the 7 it hunted through, ending inside the window
+        # or at most half a (measured) size-2 step off.
+        assert result["attempts"] < len(TICKET_TRACE), lens.steps
+        assert abs(lens.pos - TICKET_TARGET) <= TICKET_UNITS[2] / 2
+
+    @pytest.mark.parametrize(
+        "start,trace",
+        [(TICKET_START, TICKET_TRACE), (TICKET_RETRY_START, TICKET_RETRY_TRACE)],
+    )
+    def test_without_learning_it_still_stops_at_the_closer_side(
+        self, ticket_lens, monkeypatch, start, trace
+    ):
+        # The table as the only estimate (the 0.3.0 loop's view of the lens):
+        # it flips across the target, and must stop at the closer position -
+        # the retry in the ticket ended on the farther one, 40999.
+        session, lens = ticket_lens(start)
+        monkeypatch.setattr(
+            session, "_learned_sizes", lambda sizes, seen: (list(sizes), sizes[0][1])
+        )
+        result = session.set_focus_position(TICKET_TARGET)
+
+        assert result["stop_reason"] == "hunting"
+        assert lens.pos == 39366, lens.steps  # 634 off, not 999
+        assert result["ok"] is True and result["near_miss"] is True
+        # It spots the back and forth instead of waiting out the reversal cap.
+        assert len(lens.steps) <= len(trace), lens.steps
+
+    @pytest.mark.parametrize("target", list(range(20000, 60001, 1777)))
+    def test_any_target_on_a_long_lens_lands_or_stops_at_the_closer_side(
+        self, ticket_lens, target
+    ):
+        # The same 4x lens without the ticket's exact read-backs: wherever the
+        # target falls between two size-2 positions, the loop ends inside the
+        # tolerance or within half a size-2 step - never by hunting.
+        session, lens = ticket_lens(TICKET_START)
+        lens.jumps.clear()
+        result = session.set_focus_position(target)
+        assert result["stop_reason"] in ("within_tolerance", "within_half_nudge"), (
+            target, lens.steps, result,
+        )
+        assert abs(lens.pos - target) <= TICKET_UNITS[2] / 2, (target, lens.steps)
+
+
+class TestAcceptTolerance:
+    def test_defaults_to_twice_the_tolerance(self, ticket_lens):
+        from session import _DEFAULT_FOCUS_ACCEPT_FACTOR
+
+        session, _ = ticket_lens(TICKET_RETRY_START)
+        result = session.set_focus_position(TICKET_TARGET)
+        assert result["accept_tolerance"] == round(_DEFAULT_FOCUS_ACCEPT_FACTOR * 400)
+        result = session.set_focus_position(TICKET_TARGET, tolerance=100)
+        assert result["accept_tolerance"] == round(_DEFAULT_FOCUS_ACCEPT_FACTOR * 100)
+
+    def test_a_miss_past_the_accept_window_is_not_ok(self, ticket_lens, logger):
+        session, lens = ticket_lens(TICKET_RETRY_START)
+        result = session.set_focus_position(TICKET_TARGET, accept_tolerance=500)
+        assert abs(lens.pos - TICKET_TARGET) == 634
+        assert result["ok"] is False
+        assert result["near_miss"] is False
+        assert "warning" not in result
+        assert "focus did not reach 40000" in logger.text("warning")
+
+    def test_config_sets_the_window_and_the_call_overrides_it(self, ticket_lens):
+        session, _ = ticket_lens(TICKET_RETRY_START, movie_focus_accept_tolerance=500)
+        assert session.set_focus_position(TICKET_TARGET)["ok"] is False
+        result = session.set_focus_position(TICKET_TARGET, accept_tolerance=700)
+        assert result["ok"] is True and result["accept_tolerance"] == 700
+
+    def test_never_narrower_than_the_tolerance(self, ticket_lens):
+        session, _ = ticket_lens(TICKET_RETRY_START)
+        result = session.set_focus_position(TICKET_TARGET, tolerance=700, accept_tolerance=100)
+        assert result["accept_tolerance"] == 700
+        assert result["ok"] is True and result["near_miss"] is False
+
+
+# Step 1.1 of CONSULT-2297, measured on the rig 2026-11-05: |movement| medians
+# per nudge size at the two zooms the products shoot at.
+RIG_16MM = {2: 1690, 3: 4160, 4: 10980}
+RIG_35MM = {2: 354, 3: 995, 4: 2878}
+
+
+class ZoomLens:
+    """A lens with the rig's measured nudge sizes at one zoom: sizes 2-4 the
+    medians, the others the module's table for that zoom (not measured), and
+    each move `growth` larger per unit of position above 40000 (size 2 at
+    16mm ran ~1555 at 29k and ~1850 at 50k). Read back instantly."""
+
+    def __init__(self, start, measured, table, growth=0.0):
+        self.pos = start
+        self.units = {s: table[s - 1] for s in range(1, 8)}
+        self.units.update(measured)
+        self.growth = growth
+        self.steps = []
+        self.path = [start]
+
+    def nudge(self, step):
+        self.steps.append(step)
+        travel = self.units[abs(step)] * (1 + self.growth * (self.pos - 40000))
+        self.pos = max(0, min(0xFFFF, round(self.pos + (1 if step > 0 else -1) * travel)))
+        self.path.append(self.pos)
+
+    def install(self, session, monkeypatch):
+        monkeypatch.setattr(session, "_nudge_focus", self.nudge)
+        monkeypatch.setattr(session, "_movie_read_once", lambda: self.pos)
+        return self
+
+
+@pytest.fixture
+def zoomed(movie_session, fake):
+    """A session with the module's default per-zoom tables and near-miss
+    windows, the fake lens zoomed to `mm`."""
+    from session import _DEFAULT_FOCUS_ACCEPT_BY_ZOOM, _DEFAULT_MOVIE_NUDGE_UNITS_BY_ZOOM
+
+    def build(mm, **overrides):
+        config = dict(
+            movie_nudge_units=MEASURED_UNITS,
+            movie_nudge_units_by_zoom=dict(_DEFAULT_MOVIE_NUDGE_UNITS_BY_ZOOM),
+            movie_focus_accept_by_zoom=dict(_DEFAULT_FOCUS_ACCEPT_BY_ZOOM),
+            movie_max_nudge_size=6,
+        )
+        config.update(overrides)
+        session = movie_session(**config)
+        fake._zoom_um = float(mm * 1000)
+        return session
+
+    return build
+
+
+class TestZoomTables:
+    def test_the_table_follows_the_focal_length(self, zoomed, fake):
+        from session import _NUDGE_UNITS_16MM, _NUDGE_UNITS_35MM
+
+        session = zoomed(16)
+        assert session._nudge_table() == (_NUDGE_UNITS_16MM, 16.0)
+        fake._zoom_um = 35000.0
+        assert session._nudge_table() == (_NUDGE_UNITS_35MM, 35.0)
+        # Outside the calibrated range: the nearest end.
+        fake._zoom_um = 12000.0
+        assert session._nudge_table()[0] == _NUDGE_UNITS_16MM
+        # Between: every moving size strictly between the two, log-linear.
+        fake._zoom_um = 24000.0
+        mid, mm = session._nudge_table()
+        assert mm == 24.0
+        for a, m, b in zip(_NUDGE_UNITS_35MM, mid, _NUDGE_UNITS_16MM):
+            assert (a == m == b == 0) or a < m < b
+        t = math.log(24 / 16) / math.log(35 / 16)
+        assert mid[1] == pytest.approx(math.exp((1 - t) * math.log(1690) + t * math.log(354)))
+
+    def test_no_focal_length_or_no_tables_falls_back_to_the_flat_table(
+        self, zoomed, movie_session, fake
+    ):
+        session = zoomed(16)
+        fake.power_zoom = False
+        assert session._nudge_table() == (tuple(MEASURED_UNITS), None)
+
+    def test_without_tables_the_flat_table_is_used(self, movie_session):
+        session = movie_session(movie_nudge_units=MEASURED_UNITS)
+        assert session._nudge_table() == (tuple(MEASURED_UNITS), None)
+
+    def test_at_16mm_a_short_move_is_one_size_2_nudge(self, zoomed, monkeypatch):
+        from session import CameraSession
+
+        # The 35mm-ish flat table would send a size 3 here (693 <= 1000) -
+        # 4160 units at 16mm, overshooting by 3000 and starting the hunt.
+        flat = [(s, float(u)) for s, u in enumerate(MEASURED_UNITS, 1) if u > 0]
+        assert CameraSession._pick_nudge(flat, 1000, 6) == 3
+
+        for start, target in ((39000, 40000), (41000, 40000)):
+            session = zoomed(16)
+            lens = ZoomLens(start, RIG_16MM, MEASURED_UNITS).install(session, monkeypatch)
+            result = session.set_focus_position(target)
+            assert lens.steps[0] in (2, -2), lens.steps
+            assert result["attempts"] == 1, lens.steps
+            assert result["ok"] is True and result["stop_reason"] != "hunting", result
+
+    @pytest.mark.parametrize(
+        "start", [8000, 20000, 30000, 37000, 38500, 39300, 40700, 41500, 43000, 50000, 59142]
+    )
+    @pytest.mark.parametrize(
+        # 16mm growth: size 2 ran ~1555 at 29k and ~1850 at 50k, ~9e-6 per unit.
+        "mm,measured,growth", [(16, RIG_16MM, 9e-6), (35, RIG_35MM, 0.0)]
+    )
+    def test_the_rig_lens_lands_from_both_sides_of_40000(
+        self, zoomed, monkeypatch, mm, measured, growth, start
+    ):
+        from session import _DEFAULT_MOVIE_NUDGE_UNITS_BY_ZOOM
+
+        session = zoomed(mm)
+        table = _DEFAULT_MOVIE_NUDGE_UNITS_BY_ZOOM[float(mm)]
+        lens = ZoomLens(start, measured, table, growth).install(session, monkeypatch)
+        # At 16mm a size-2 nudge is ~1700, so the closest reachable position
+        # can be ~850 off: the 16mm default near-miss window (1000) covers it;
+        # 35mm keeps 2 x tolerance.
+        result = session.set_focus_position(40000)
+        assert result["accept_tolerance"] == {16: 1000, 35: 800}[mm]
+
+        assert result["stop_reason"] in ("within_tolerance", "within_half_nudge"), (
+            lens.path, result,
+        )
+        # As close as the smallest nudge allows: within half of one (10%
+        # margin for the position growth), so another would land further off.
+        assert result["miss"] <= max(400, 1.1 * lens.units[2] / 2), (lens.path, result)
+        # Inside the tolerance, or a near miss (ok, flagged) - never a failure.
+        assert result["ok"] is True, (lens.path, result)
+        assert result["near_miss"] == (result["miss"] > 400)
+
+
+class TestAcceptByZoom:
+    @pytest.mark.parametrize(
+        "zoom,tolerance,window",
+        [
+            (16, 400, 1000),
+            (35, 400, 800),   # 35mm: 2 x tolerance
+            (12, 400, 1000),  # outside the range: the nearest end
+            (50, 400, 800),
+            (16, 600, 1200),  # never below 2 x tolerance
+            (35, 100, 200),
+        ],
+    )
+    def test_the_default_window_follows_the_focal_length(self, zoomed, zoom, tolerance, window):
+        session = zoomed(zoom)
+        assert session._accept_tolerance(tolerance, None, float(zoom)) == window
+
+    def test_between_focal_lengths_it_blends(self, zoomed):
+        session = zoomed(24)
+        t = math.log(24 / 16) / math.log(35 / 16)
+        assert session._accept_tolerance(400, None, 24.0) == round((1 - t) * 1000 + t * 800)
+
+    def test_no_focal_length_is_the_factor(self, zoomed):
+        assert zoomed(16)._accept_tolerance(400, None, None) == 800
+
+    def test_the_attribute_and_the_call_win(self, zoomed):
+        session = zoomed(16, movie_focus_accept_tolerance=600)
+        assert session._accept_tolerance(400, None, 16.0) == 600
+        assert session._accept_tolerance(400, 900, 16.0) == 900
+
+    def test_a_move_at_16mm_reports_the_16mm_window(self, zoomed, monkeypatch):
+        session = zoomed(16)
+        ZoomLens(39000, RIG_16MM, MEASURED_UNITS).install(session, monkeypatch)
+        assert session.set_focus_position(40000)["accept_tolerance"] == 1000
+
+
+# The rig's own failing cycle (2026-11-05 logs, all 13 shoes failures): at
+# 16mm, target 40000. Whether a shoes drive failed depended only on where the
+# previous outfits drive left the lens. From 58849 the error (18849) was just
+# under the flat table's size 6 (18893), so it sent size 5 and hunted; from
+# 59134 it sent size 6, hit the near stop, and landed. The read-backs were
+# fully repeatable; these are every 16mm transition the logs saw.
+RIG_16MM_LOG = {
+    (58849, -5): 28529, (28529, +4): 38465, (38465, +3): 42542,
+    (42542, -2): 40999, (40999, -2): 39366, (39366, +2): 40999,
+    (59134, -6): 0, (0, +5): 18019, (18019, +5): 42304,
+    (42304, -3): 38183, (38183, +2): 39920,
+    (63482, -4): 50131, (50131, -4): 38465, (42775, -2): 41264, (41264, -2): 39625,
+}
+RIG_HUNT = [28529, 38465, 42542, 40999, 39366, 40999]
+RIG_LANDING = [0, 18019, 42304, 38183, 39920]
+
+
+class RigLog16mm:
+    """The 16mm lens from the rig's logs: the logged transitions exactly, and
+    off that path moves that grow with the start position as the logs show
+    (size 5: 18019 from 0, 24285 from 18019; size 4: 9936 / 11666 / 13351
+    from 28.5k / 50k / 63k; size 3 4077-4310; size 2 1511-1737). Size 6 runs
+    into a stop from anywhere in the range."""
+
+    def __init__(self, start):
+        self.pos = start
+        self.steps = []
+        self.path = [start]
+
+    @staticmethod
+    def travel(size, at):
+        if size == 5:
+            return 18019 + (24285 - 18019) / 18019 * at
+        if size == 4:
+            return 9936 + (11666 - 9936) / (50131 - 28529) * (at - 28529)
+        if size >= 6:
+            return 0xFFFF
+        base = {1: 0, 2: 1640, 3: 4170}[size]
+        return base * (1 + 9e-6 * (at - 40000))
+
+    def nudge(self, step):
+        self.steps.append(step)
+        to = RIG_16MM_LOG.get((self.pos, step))
+        if to is None:
+            to = round(self.pos + (1 if step > 0 else -1) * self.travel(abs(step), self.pos))
+        self.pos = max(0, min(0xFFFF, to))
+        self.path.append(self.pos)
+
+    def install(self, session, monkeypatch):
+        monkeypatch.setattr(session, "_nudge_focus", self.nudge)
+        monkeypatch.setattr(session, "_movie_read_once", lambda: self.pos)
+        return self
+
+
+class TestRigFailingCycle:
+    @pytest.mark.parametrize("start,path", [(58849, RIG_HUNT), (59134, RIG_LANDING)])
+    def test_the_old_flat_table_reproduces_the_log(
+        self, movie_session, fake, monkeypatch, start, path
+    ):
+        # 0.3.0's view: the flat table, nothing learned during the move.
+        session = movie_session(movie_nudge_units=MEASURED_UNITS, movie_max_nudge_size=6)
+        fake._zoom_um = 16000.0
+        monkeypatch.setattr(
+            session, "_learned_sizes", lambda sizes, seen: (list(sizes), sizes[0][1])
+        )
+        lens = RigLog16mm(start).install(session, monkeypatch)
+        result = session.set_focus_position(40000)
+        assert lens.path[1 : len(path) + 1] == path, lens.path
+        if start == 58849:
+            # It hunts 40999 <-> 39366; 0.3.0 failed here at 40999.
+            assert result["stop_reason"] == "hunting"
+        else:
+            assert result["stop_reason"] == "within_tolerance"
+
+    @pytest.mark.parametrize("start", [58849, 59134])
+    def test_the_new_loop_lands_from_both_outfits_end_points(
+        self, zoomed, monkeypatch, start
+    ):
+        session = zoomed(16)
+        lens = RigLog16mm(start).install(session, monkeypatch)
+        result = session.set_focus_position(40000)
+
+        assert result["ok"] is True, (lens.path, result)
+        assert result["stop_reason"] != "hunting", (lens.path, result)
+        assert result["miss"] <= 1000, (lens.path, result)
+        assert result["near_miss"] == (result["miss"] > 400)
 
 
 class TestFallback:

@@ -250,10 +250,12 @@ class CommandHandler:
         if isinstance(position, bool) or not isinstance(position, (int, float)):
             raise ValueError(f"`position` must be an integer, got {position!r}")
         tolerance = _optional_number(opts.get("tolerance"))
+        accept = _optional_number(opts.get("accept_tolerance"))
         return await _to_thread(
             self._session.set_focus_position,
             int(position),
             None if tolerance is None else int(tolerance),
+            None if accept is None else int(accept),
         )
 
     async def _cmd_autofocus_once(self, opts: Mapping[str, Any]) -> Dict[str, ValueTypes]:

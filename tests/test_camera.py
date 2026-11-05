@@ -102,6 +102,11 @@ class TestValidateConfig:
             ({"focus_method": "follow"}, "focus_method"),
             ({"focus_method": "movie", "movie_focus_fallback": "af"}, "movie_focus_fallback"),
             ({"movie_focus_tolerance": -1}, "movie_focus_tolerance"),
+            ({"movie_focus_accept_tolerance": -1}, "movie_focus_accept_tolerance"),
+            ({"movie_nudge_units_by_zoom": [1, 2]}, "movie_nudge_units_by_zoom"),
+            ({"movie_nudge_units_by_zoom": {"wide": [0, 1, 2, 3, 4, 5, 6]}}, "movie_nudge_units_by_zoom"),
+            ({"movie_nudge_units_by_zoom": {"16": [1, 2, 3]}}, "movie_nudge_units_by_zoom"),
+            ({"movie_nudge_units_by_zoom": {"16": [0, -1, 2, 3, 4, 5, 6]}}, "movie_nudge_units_by_zoom"),
             ({"movie_mode_timeout_s": 0}, "movie_mode_timeout_s"),
             ({"movie_units_per_nudge": 0}, "movie_units_per_nudge"),
             ({"movie_max_nudges": 0}, "movie_max_nudges"),
@@ -291,6 +296,17 @@ class TestNewCommands:
 
         assert (await camera.do_command({"get_focus_position": {}}))["position"] == 240
 
+    async def test_set_focus_position_passes_the_accept_tolerance(self, camera, monkeypatch):
+        calls = []
+        monkeypatch.setattr(
+            camera._session, "set_focus_position", lambda *args: calls.append(args) or {}
+        )
+        await camera.do_command(
+            {"set_focus_position": {"position": 40000, "tolerance": 400, "accept_tolerance": 900}}
+        )
+        await camera.do_command({"set_focus_position": {"position": 40000}})
+        assert calls == [(40000, 400, 900), (40000, None, None)]
+
     async def test_set_focus_position_needs_an_integer(self, camera):
         with pytest.raises(ValueError, match="position"):
             await camera.do_command({"set_focus_position": {}})
@@ -438,3 +454,50 @@ class TestZoomDispatch:
             await camera.do_command(
                 {"set_property_raw": {"name": "zoom_operation", "value": -1, "value_type": "0x2002"}}
             )
+
+
+class TestNudgeUnitsByZoom:
+    def test_defaults_to_the_built_in_tables(self):
+        from models.camera import _nudge_units_by_zoom
+        from session import _DEFAULT_MOVIE_NUDGE_UNITS_BY_ZOOM
+
+        assert _nudge_units_by_zoom({}) == _DEFAULT_MOVIE_NUDGE_UNITS_BY_ZOOM
+
+    def test_a_config_table_is_read_by_focal_length(self):
+        from models.camera import _nudge_units_by_zoom
+
+        tables = {"18": [0, 1, 2, 3, 4, 5, 6], "50": [0, 2, 4, 6, 8, 10, 12]}
+        assert _nudge_units_by_zoom({"movie_nudge_units_by_zoom": tables}) == {
+            18.0: (0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0),
+            50.0: (0.0, 2.0, 4.0, 6.0, 8.0, 10.0, 12.0),
+        }
+
+    def test_an_own_flat_table_turns_the_built_in_ones_off(self):
+        from models.camera import _nudge_units_by_zoom
+
+        assert _nudge_units_by_zoom({"movie_nudge_units": [0, 1, 2, 3, 4, 5, 6]}) == {}
+        # Unless it names per-zoom tables too; {} turns them off explicitly.
+        assert _nudge_units_by_zoom({"movie_nudge_units_by_zoom": {}}) == {}
+
+    def test_a_valid_table_validates(self):
+        Camera.validate_config(
+            make_config(movie_nudge_units_by_zoom={"16": [0, 1690, 4160, 10980, 1, 2, 3]})
+        )
+
+
+class TestAcceptByZoomPlumbing:
+    def test_the_built_in_tables_bring_their_windows(self, camera):
+        from session import _DEFAULT_FOCUS_ACCEPT_BY_ZOOM
+
+        assert camera._session_config.movie_focus_accept_by_zoom == _DEFAULT_FOCUS_ACCEPT_BY_ZOOM
+
+    @pytest.mark.parametrize(
+        "attrs",
+        [
+            {"movie_nudge_units_by_zoom": {"18": [0, 1, 2, 3, 4, 5, 6]}},
+            {"movie_nudge_units": [0, 1, 2, 3, 4, 5, 6]},
+        ],
+    )
+    def test_own_tables_do_not(self, camera, capture_dir, attrs):
+        camera.reconfigure(make_config(capture_dir=capture_dir, binding="fake", **attrs), {})
+        assert camera._session_config.movie_focus_accept_by_zoom == {}

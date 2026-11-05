@@ -27,8 +27,10 @@ exponential backoff, so a camera that is unplugged, power-cycled or plugged in
 ten minutes after viam-server started all end up in the same place.
 """
 
+import math
 import os
 import queue
+import statistics
 import threading
 import time
 from dataclasses import dataclass, field
@@ -142,12 +144,50 @@ _FOCUS_READ_POLL_S = 0.05
 # both directions). Size 1 does not move this lens at all, and each size above
 # moves ~2.5-3x the one below; size 7 runs for seconds, often into a stop.
 _DEFAULT_MOVIE_NUDGE_UNITS = (0.0, 382.0, 693.0, 2329.0, 6470.0, 18893.0, 40000.0)
+# The same nudges depend heavily on zoom (CONSULT-2297). Re-measured on the rig
+# 2026-11-05 (trace_focus_read after one nudge, both directions, starts
+# 30000/40000/50000/59142; medians of |movement|):
+#   35mm (outfits): size 2 354 (295-493), 3 995 (783-1250), 4 2878 (1900-3347)
+#   16mm (shoes):   size 2 1690 (1555-1938), 3 4160 (3141-4780),
+#                   4 10980 (9239-12979) - 4.4x/6x/4.7x the table above, and
+#                   growing mildly with position (size 2: ~1555 at 29k, ~1850
+#                   at 50k).
+# Sizes 1 and 5-7 were not re-measured: at 35mm they keep the 2026-10-27
+# table (evidently measured near 35mm); at 16mm they are EXTRAPOLATED, the
+# 35mm values x4.7. The closed loop re-learns every size it sends anyway.
+_NUDGE_UNITS_35MM = (0.0, 354.0, 995.0, 2878.0, 6470.0, 18893.0, 40000.0)
+_NUDGE_UNITS_16MM = (0.0, 1690.0, 4160.0, 10980.0, 30409.0, 88797.0, 188000.0)
+# Focal length (mm) -> units per nudge size 1..7. Between two calibrated focal
+# lengths the table is interpolated log-linearly (in log focal length and log
+# units: the sizes scale by a factor, not an offset); outside them the nearest
+# one is used. See `_nudge_table_for_zoom`.
+_DEFAULT_MOVIE_NUDGE_UNITS_BY_ZOOM: Dict[float, Tuple[float, ...]] = {
+    16.0: _NUDGE_UNITS_16MM,
+    35.0: _NUDGE_UNITS_35MM,
+}
 # Closed-loop give-ups, so a move ends in ok=false rather than the job
 # timeout: direction reversals (hunting around a target narrower than the
 # smallest nudge), and nudges in a row that didn't move the lens (each retried
 # one size bigger).
 _FOCUS_MAX_REVERSALS = 4
 _FOCUS_MAX_STALLS = 3
+# Movie focus: a read-back outside the tolerance but within this many times it
+# is a near miss - `ok: true` with a `warning`, so the caller can shoot and
+# flag the frame instead of failing. Overridden by `movie_focus_accept_tolerance`
+# (config) or `accept_tolerance` (per call).
+# PROVISIONAL (CONSULT-2297): 2x is a placeholder until the sharpness check on
+# the rig (shoot at target, +-800, +-1600 at f/8) says how far off is still
+# sharp enough.
+_DEFAULT_FOCUS_ACCEPT_FACTOR = 2.0
+# Per-focal-length near-miss windows for the built-in nudge tables, in
+# follow-focus units (mm -> window; None = the factor above x tolerance). At
+# 16mm a size-2 nudge moves ~1700 units, so the closest reachable position can
+# be ~850 off - outside 2 x 400 - and the user chose +-1000 for shoes. 35mm
+# keeps 2 x tolerance. Blended between focal lengths like the tables (see
+# `_accept_for_zoom`), never below the factor x tolerance. Precedence: per call
+# > `movie_focus_accept_tolerance` > this > the factor.
+# PROVISIONAL (CONSULT-2297): until the Step 1.3 sharpness test on the rig.
+_DEFAULT_FOCUS_ACCEPT_BY_ZOOM: Dict[float, Optional[float]] = {16.0: 1000.0, 35.0: None}
 
 # OnWarning codes (CrWarning_* / CrNotify_* in the SDK's CrError.h), so the log
 # says what happened instead of a bare hex value. Most are not problems: the
@@ -280,6 +320,15 @@ class SessionConfig:
     # moves roughly 700 units on the FE PZ 16-35 and the closed loop stops
     # within half of one, so a window narrower than one nudge can miss.
     movie_focus_tolerance: int = 400
+    # A read-back outside `movie_focus_tolerance` but within this is a near
+    # miss: `ok: true` plus a `warning`. None = `_DEFAULT_FOCUS_ACCEPT_FACTOR`
+    # times the tolerance in force. Never narrower than the tolerance.
+    movie_focus_accept_tolerance: Optional[int] = None
+    # Per-focal-length defaults for that window (mm -> units, None = factor
+    # x tolerance), used when neither the call nor the attribute sets one.
+    # The module passes `_DEFAULT_FOCUS_ACCEPT_BY_ZOOM` along with the
+    # built-in nudge tables it belongs to; empty here.
+    movie_focus_accept_by_zoom: Dict[float, Optional[float]] = field(default_factory=dict)
     # Longest wait for the body to finish a stills<->movie switch and for the
     # lens to start publishing its position.
     movie_mode_timeout_s: float = 5.0
@@ -291,6 +340,12 @@ class SessionConfig:
     # The closed loop picks the largest size that doesn't overshoot; a size
     # listed as 0 (size 1 on the FE PZ 16-35) is never used.
     movie_nudge_units: Tuple[float, ...] = _DEFAULT_MOVIE_NUDGE_UNITS
+    # Per-focal-length tables (mm -> 7 units), picked by the lens's current
+    # zoom_distance at the start of each move (see `_nudge_table_for_zoom`).
+    # Empty, or a lens that doesn't report a focal length: `movie_nudge_units`.
+    # The module's default is `_DEFAULT_MOVIE_NUDGE_UNITS_BY_ZOOM` (camera.py);
+    # empty here so a bare SessionConfig keeps the flat table.
+    movie_nudge_units_by_zoom: Dict[float, Tuple[float, ...]] = field(default_factory=dict)
     # Largest nudge size the closed loop sends. Size 7 can run the lens for
     # seconds, into a stop, so it is off by default.
     movie_max_nudge_size: int = 6
@@ -514,14 +569,19 @@ class CameraSession:
         )
 
     def set_focus_position(
-        self, position: int, tolerance: Optional[int] = None
+        self,
+        position: int,
+        tolerance: Optional[int] = None,
+        accept_tolerance: Optional[int] = None,
     ) -> Dict[str, Any]:
         # The default tolerance depends on the backend's units, so it is
-        # resolved on the owner thread.
+        # resolved on the owner thread. `accept_tolerance` (the near-miss
+        # window) applies only to movie focus.
         tol = None if tolerance is None else int(tolerance)
+        accept = None if accept_tolerance is None else int(accept_tolerance)
         return self._submit(
             "set_focus_position",
-            lambda: self._do_set_focus(int(position), tol),
+            lambda: self._do_set_focus(int(position), tol, accept),
             timeout=self._focus_motion_budget_s(),
         )
 
@@ -1542,10 +1602,48 @@ class CameraSession:
             return self._movie_read()
         return self._movie_read(previous=self._movie_read_once())
 
-    def _nudge_sizes(self) -> List[Tuple[int, float]]:
+    @staticmethod
+    def _nudge_table_for_zoom(
+        tables: Dict[float, Tuple[float, ...]], mm: float
+    ) -> Tuple[float, ...]:
+        """The nudge table at focal length `mm`: the calibrated table when `mm`
+        is one, the nearest end one outside the calibrated range, and between
+        two a log-linear blend - each size's units interpolated in log units
+        against log focal length (a size listed as 0 at either end blends
+        linearly, so 0 at both stays 0)."""
+        points = sorted(tables.items())
+        if mm <= points[0][0]:
+            return tuple(points[0][1])
+        if mm >= points[-1][0]:
+            return tuple(points[-1][1])
+        for (f1, u1), (f2, u2) in zip(points, points[1:]):
+            if f1 <= mm <= f2:
+                t = math.log(mm / f1) / math.log(f2 / f1)
+                return tuple(
+                    math.exp((1 - t) * math.log(a) + t * math.log(b))
+                    if a > 0 and b > 0
+                    else (1 - t) * a + t * b
+                    for a, b in zip(u1, u2)
+                )
+        return tuple(points[-1][1])  # unreachable: mm lies in some interval
+
+    def _nudge_table(self) -> Tuple[Tuple[float, ...], Optional[float]]:
+        """(units per nudge size 1..7, focal length it was picked for). From
+        `movie_nudge_units_by_zoom` at the lens's current focal length, else
+        (no tables, or no focal length to read) `movie_nudge_units` and None."""
+        tables = self._config.movie_nudge_units_by_zoom
+        if tables:
+            prop = self._read_optional("zoom_distance")
+            if prop is not None and prop.value is not None and int(prop.value) > 0:
+                mm = int(prop.value) / 1000.0
+                return self._nudge_table_for_zoom(tables, mm), mm
+        return tuple(self._config.movie_nudge_units), None
+
+    def _nudge_sizes(self, table: Optional[Tuple[float, ...]] = None) -> List[Tuple[int, float]]:
         """(size, units) for every nudge size the closed loop may send: one
-        that moves the lens, up to `movie_max_nudge_size`."""
-        table = list(self._config.movie_nudge_units)[:7]
+        that moves the lens, up to `movie_max_nudge_size`. `table` defaults to
+        `movie_nudge_units`."""
+        table = list(self._config.movie_nudge_units if table is None else table)[:7]
         limit = max(1, min(7, int(self._config.movie_max_nudge_size)))
         sizes = [(s, float(u)) for s, u in enumerate(table, start=1) if u > 0 and s <= limit]
         if not sizes:
@@ -1563,68 +1661,139 @@ class CameraSession:
         fitting = [s for s, u in allowed if u <= distance]
         return max(fitting) if fitting else allowed[0][0]
 
+    @staticmethod
+    def _learned_sizes(
+        sizes: List[Tuple[int, float]], seen: Dict[int, List[float]]
+    ) -> Tuple[List[Tuple[int, float]], float]:
+        """What this move has learned about the nudge sizes, from `seen` (each
+        size's measured travels). Returns (estimates, smallest).
+
+        `estimates` is `sizes` with each size's units re-estimated: a size
+        already sent is the median of its measured travels; one not yet sent
+        is its table value scaled by the median measured/table ratio of every
+        nudge so far. The table can be off for the whole lens at once (seen on
+        the rig: every size 4-6x long at the shoes zoom, CONSULT-2297), and an
+        unscaled neighbour would then be picked as if it were short.
+
+        `smallest` is the smallest size's travel - the nudge the loop ends on -
+        as measured once it has been sent, else its table value. Not the
+        scaled guess: sizes don't all run long by the same factor, and
+        over-guessing it would stop the loop too far off.
+        """
+        ratios = [m / u for s, u in sizes for m in seen.get(s, ())]
+        scale = statistics.median(ratios) if ratios else 1.0
+        estimates = [
+            (s, float(statistics.median(seen[s])) if seen.get(s) else u * scale)
+            for s, u in sizes
+        ]
+        first, table_units = sizes[0]
+        smallest = float(statistics.median(seen[first])) if seen.get(first) else table_units
+        return estimates, smallest
+
     def _movie_drive(
         self, target: int, tolerance: int, known: Optional[int] = None
-    ) -> Tuple[int, int, str, List[Tuple[int, int]]]:
+    ) -> Tuple[
+        int, int, str, List[Tuple[int, int]], List[Tuple[int, float]], Optional[float]
+    ]:
         """Closed loop: nudge toward `target` until the read-back is within
-        `tolerance`. Returns (position, nudges, stop reason, trace), the trace
-        being each nudge sent and the read-back after it. Must run in movie
-        mode.
+        `tolerance`. Returns (position, nudges, stop reason, trace, learned
+        sizes, focal length), the trace being each nudge sent and the
+        read-back after it, the learned sizes the (size, units) estimate the
+        move ended with, and the focal length (mm) its table was picked for
+        (None: the flat table). Must run in movie mode.
 
         The stop reason says which exit ended the loop: "within_tolerance",
-        "within_half_nudge", "hunting" (too many reversals), "stalled" (the
-        read-back stopped changing), "at_stop" (stalled at 0 or 65535) or
-        "budget" (`movie_max_nudges` spent).
+        "within_half_nudge", "hunting" (back and forth across the target, or
+        too many reversals), "stalled" (the read-back stopped changing),
+        "at_stop" (stalled at 0 or 65535) or "budget" (`movie_max_nudges`
+        spent).
 
-        Each nudge is the largest size in `movie_nudge_units` that doesn't
-        move further than the distance left (sizes grow ~3x per step, so
-        scaling one size linearly overshoots badly). An overshoot caps the
-        size below the one that overshot; a nudge the lens ignored earns a
-        bigger one. Every read-back waits for the body to publish the move
-        (`_movie_read`); `known` is where the module last left the lens.
+        Each nudge is the largest size that doesn't move further than the
+        distance left (sizes grow ~3x per step, so scaling one size linearly
+        overshoots badly). Sizes start from the table for the lens's current
+        focal length (`_nudge_table`: `movie_nudge_units_by_zoom`, else
+        `movie_nudge_units`) and are
+        re-estimated from every read-back during the move (`_learned_sizes`):
+        the table was measured at one zoom, and at another a nudge can travel
+        several times as far. An overshoot caps the size below the one that
+        overshot; a nudge the lens ignored earns a bigger one. Every read-back
+        waits for the body to publish the move (`_movie_read`); `known` is
+        where the module last left the lens.
 
         Below the smallest nudge the loop can't refine: once the distance left
-        is under half of one, another nudge would land further away than
-        staying put, so it stops there even outside `tolerance` (chasing a
-        narrower window only hunts back and forth). A nudge that lands further
-        off than that - they vary - is corrected like any other overshoot.
-        Either way the caller judges the read-back against `tolerance`.
+        is under half of one - as measured once it has been sent - another
+        nudge would land further away than staying put, so it stops there even
+        outside `tolerance`. If it still ends up hunting (nudges vary, so the
+        same size can go back and forth across the target), it stops at the
+        closer of the last two positions, nudging back once if that is the one
+        it just left. Either way the caller judges the read-back.
         """
-        sizes = self._nudge_sizes()
-        smallest_units = min(u for _, u in sizes)
+        table, zoom_mm = self._nudge_table()
+        sizes = self._nudge_sizes(table)
+        if zoom_mm is not None:
+            self._log(
+                "debug",
+                f"focus nudge table for {zoom_mm:g}mm: "
+                + ", ".join(f"{s}:{u:.0f}" for s, u in sizes),
+            )
         largest = max(s for s, _ in sizes)
-        pos = self._movie_first_read(known)
+        start = pos = self._movie_first_read(known)
         nudges = stalls = reversals = 0
         cap, last_sign, last_size = largest, 0, 0
+        seen: Dict[int, List[float]] = {}
         trace: List[Tuple[int, int]] = []
         while True:
+            learned, smallest = self._learned_sizes(sizes, seen)
             error = target - pos
             if abs(error) <= tolerance:
                 reason = "within_tolerance"
                 break
             sign = 1 if error > 0 else -1  # positive near/far drives toward far
-            if abs(error) < smallest_units / 2:
-                # The smallest nudge would overshoot further than we are now.
+            if abs(error) < smallest / 2:
+                # The smallest nudge (as measured) would overshoot further
+                # than we are now.
                 reason = "within_half_nudge"
                 break
             if nudges >= int(self._config.movie_max_nudges):
                 reason = "budget"
                 break
-            if last_sign and sign != last_sign:
+            reversing = bool(last_sign) and sign != last_sign
+            if reversing:
                 reversals += 1
-                if reversals > _FOCUS_MAX_REVERSALS:
-                    # Hunting around a target the steps can't land in.
-                    reason = "hunting"
-                    break
                 cap = max(sizes[0][0], last_size - 1)
-            size = self._pick_nudge(sizes, abs(error), cap)
+            size = self._pick_nudge(learned, abs(error), cap)
             size = min(largest, size + stalls)
-            self._nudge_focus(sign * size)
+            step = sign * size
+            # Back and forth: the last nudge undid the one before, and this
+            # one would redo it - the lens can't land between the two.
+            flip_flop = (
+                reversing and len(trace) >= 2
+                and trace[-1][0] == -trace[-2][0] and step == trace[-2][0]
+            )
+            if flip_flop or reversals > _FOCUS_MAX_REVERSALS:
+                reason = "hunting"
+                previous = trace[-2][1] if len(trace) >= 2 else start
+                if abs(target - previous) < abs(target - pos):
+                    # The position before the last nudge was closer: one
+                    # nudge back, and stop wherever it lands.
+                    back = -trace[-1][0]
+                    self._nudge_focus(back)
+                    nudges += 1
+                    moved_to = self._movie_read(previous=pos)
+                    trace.append((back, moved_to))
+                    self._log(
+                        "debug",
+                        f"focus hunting: back to the closer side, nudge {back:+d}: "
+                        f"read back {moved_to}",
+                    )
+                    pos = moved_to
+                break
+            self._nudge_focus(step)
             nudges += 1
             last_sign, last_size = sign, size
             moved_to = self._movie_read(previous=pos)
-            trace.append((sign * size, moved_to))
-            self._log("debug", f"focus nudge {sign * size:+d}: read back {moved_to}")
+            trace.append((step, moved_to))
+            self._log("debug", f"focus nudge {step:+d}: read back {moved_to}")
             if moved_to == pos:
                 at_stop = moved_to <= 0 if sign < 0 else moved_to >= _FOLLOW_FOCUS_MAX
                 stalls += 1
@@ -1636,10 +1805,56 @@ class CameraSession:
                     break
             else:
                 stalls = 0
+                if 0 < moved_to < _FOLLOW_FOCUS_MAX:
+                    # A move cut short by a stop says nothing about the size.
+                    seen.setdefault(size, []).append(float(abs(moved_to - pos)))
             pos = moved_to
-        return pos, nudges, reason, trace
+        return pos, nudges, reason, trace, learned, zoom_mm
 
-    def _do_set_focus_movie(self, target: int, tolerance: int) -> Dict[str, Any]:
+    @staticmethod
+    def _accept_for_zoom(
+        windows: Dict[float, Optional[float]], mm: float, floor: float
+    ) -> float:
+        """The per-zoom near-miss window at focal length `mm`, the same way
+        `_nudge_table_for_zoom` picks a table: the nearest end outside the
+        calibrated range, a log-linear blend (in focal length) between two.
+        A None window is `floor` (the factor x tolerance), and the result is
+        never below it."""
+        points = sorted((f, floor if v is None else float(v)) for f, v in windows.items())
+        if mm <= points[0][0]:
+            value = points[0][1]
+        elif mm >= points[-1][0]:
+            value = points[-1][1]
+        else:
+            value = points[-1][1]
+            for (f1, v1), (f2, v2) in zip(points, points[1:]):
+                if f1 <= mm <= f2:
+                    t = math.log(mm / f1) / math.log(f2 / f1)
+                    value = (1 - t) * v1 + t * v2
+                    break
+        return max(value, floor)
+
+    def _accept_tolerance(
+        self, tolerance: int, accept: Optional[int], zoom_mm: Optional[float] = None
+    ) -> int:
+        """The near-miss window: the per-call value, else the configured one,
+        else the per-zoom default at `zoom_mm` (`movie_focus_accept_by_zoom`),
+        else `_DEFAULT_FOCUS_ACCEPT_FACTOR` x the tolerance in force. Never
+        narrower than the tolerance itself."""
+        floor = _DEFAULT_FOCUS_ACCEPT_FACTOR * tolerance
+        if accept is None:
+            accept = self._config.movie_focus_accept_tolerance
+        if accept is None and zoom_mm is not None and self._config.movie_focus_accept_by_zoom:
+            accept = int(round(
+                self._accept_for_zoom(self._config.movie_focus_accept_by_zoom, zoom_mm, floor)
+            ))
+        if accept is None:
+            accept = int(round(floor))
+        return max(int(accept), int(tolerance))
+
+    def _do_set_focus_movie(
+        self, target: int, tolerance: int, accept: Optional[int] = None
+    ) -> Dict[str, Any]:
         self._require_near_far()
         clamped = max(0, min(int(target), _FOLLOW_FOCUS_MAX))
         if clamped != target:
@@ -1649,31 +1864,50 @@ class CameraSession:
                 f"(valid range 0..{_FOLLOW_FOCUS_MAX})",
             )
         known, self._movie_known = self._movie_known, None
-        position, nudges, reason, trace = self._in_movie(
+        position, nudges, reason, trace, learned, zoom_mm = self._in_movie(
             lambda: self._movie_drive(clamped, tolerance, known)
         )
+        accept = self._accept_tolerance(tolerance, accept, zoom_mm)
         self._movie_known = position
         self._state_cache = None
-        ok = abs(position - clamped) <= tolerance
-        if not ok:
-            steps = ", ".join(f"{step:+d}->{read}" for step, read in trace) or "none"
-            self._log(
-                "warning",
-                f"focus did not reach {clamped} after {nudges} nudge(s): read "
-                f"back {position} (tolerance {tolerance}), stopped: {reason}. "
-                f"Nudges (size->read-back): {steps}. If it never moved, "
-                "check that nothing is holding the focus ring.",
-            )
-        return {
+        miss = abs(position - clamped)
+        within = miss <= tolerance
+        near_miss = not within and miss <= accept
+        result: Dict[str, Any] = {
             "position": position,
             "target": clamped,
             "tolerance": tolerance,
+            "accept_tolerance": accept,
+            "miss": miss,
+            "near_miss": near_miss,
             "attempts": nudges,
-            "ok": ok,
+            "ok": within or near_miss,
             "units": "follow_focus",
             "method": "movie",
             "stop_reason": reason,
         }
+        if not within:
+            steps = ", ".join(f"{step:+d}->{read}" for step, read in trace) or "none"
+            sizes = ", ".join(f"{s}:{u:.0f}" for s, u in learned)
+            detail = (
+                f"after {nudges} nudge(s): read back {position}, {miss} off "
+                f"(tolerance {tolerance}, accept {accept}), stopped: {reason}. "
+                f"Nudges (size->read-back): {steps}. Measured units per nudge "
+                f"size: {sizes}."
+            )
+            if near_miss:
+                result["warning"] = (
+                    f"focus near miss: landed {miss} from {clamped} (tolerance "
+                    f"{tolerance}, accepted within {accept})"
+                )
+                self._log("warning", f"focus near miss, accepted: target {clamped} {detail}")
+            else:
+                self._log(
+                    "warning",
+                    f"focus did not reach {clamped} {detail} If it never moved, "
+                    "check that nothing is holding the focus ring.",
+                )
+        return result
 
     def _do_read_focus_movie(self) -> int:
         known = self._movie_known
@@ -1799,13 +2033,15 @@ class CameraSession:
         value = self._binding.get_property("focus_position").value
         return int(value)
 
-    def _do_set_focus(self, position: int, tolerance: Optional[int]) -> Dict[str, Any]:
+    def _do_set_focus(
+        self, position: int, tolerance: Optional[int], accept: Optional[int] = None
+    ) -> Dict[str, Any]:
         self._ensure_manual_focus()
         backend = self._resolve_focus_backend()
         if backend == "movie":
             tol = int(self._config.movie_focus_tolerance if tolerance is None else tolerance)
             return self._movie_or_fallback(
-                lambda: self._do_set_focus_movie(position, tol),
+                lambda: self._do_set_focus_movie(position, tol, accept),
                 lambda: self._do_set_focus_emulated(position),
             )
         if backend == "nudge":
