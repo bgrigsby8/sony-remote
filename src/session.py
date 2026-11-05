@@ -179,6 +179,15 @@ _FOCUS_MAX_STALLS = 3
 # the rig (shoot at target, +-800, +-1600 at f/8) says how far off is still
 # sharp enough.
 _DEFAULT_FOCUS_ACCEPT_FACTOR = 2.0
+# Per-focal-length near-miss windows for the built-in nudge tables, in
+# follow-focus units (mm -> window; None = the factor above x tolerance). At
+# 16mm a size-2 nudge moves ~1700 units, so the closest reachable position can
+# be ~850 off - outside 2 x 400 - and the user chose +-1000 for shoes. 35mm
+# keeps 2 x tolerance. Blended between focal lengths like the tables (see
+# `_accept_for_zoom`), never below the factor x tolerance. Precedence: per call
+# > `movie_focus_accept_tolerance` > this > the factor.
+# PROVISIONAL (CONSULT-2297): until the Step 1.3 sharpness test on the rig.
+_DEFAULT_FOCUS_ACCEPT_BY_ZOOM: Dict[float, Optional[float]] = {16.0: 1000.0, 35.0: None}
 
 # OnWarning codes (CrWarning_* / CrNotify_* in the SDK's CrError.h), so the log
 # says what happened instead of a bare hex value. Most are not problems: the
@@ -315,6 +324,11 @@ class SessionConfig:
     # miss: `ok: true` plus a `warning`. None = `_DEFAULT_FOCUS_ACCEPT_FACTOR`
     # times the tolerance in force. Never narrower than the tolerance.
     movie_focus_accept_tolerance: Optional[int] = None
+    # Per-focal-length defaults for that window (mm -> units, None = factor
+    # x tolerance), used when neither the call nor the attribute sets one.
+    # The module passes `_DEFAULT_FOCUS_ACCEPT_BY_ZOOM` along with the
+    # built-in nudge tables it belongs to; empty here.
+    movie_focus_accept_by_zoom: Dict[float, Optional[float]] = field(default_factory=dict)
     # Longest wait for the body to finish a stills<->movie switch and for the
     # lens to start publishing its position.
     movie_mode_timeout_s: float = 5.0
@@ -1678,12 +1692,15 @@ class CameraSession:
 
     def _movie_drive(
         self, target: int, tolerance: int, known: Optional[int] = None
-    ) -> Tuple[int, int, str, List[Tuple[int, int]], List[Tuple[int, float]]]:
+    ) -> Tuple[
+        int, int, str, List[Tuple[int, int]], List[Tuple[int, float]], Optional[float]
+    ]:
         """Closed loop: nudge toward `target` until the read-back is within
         `tolerance`. Returns (position, nudges, stop reason, trace, learned
-        sizes), the trace being each nudge sent and the read-back after it,
-        and the learned sizes the (size, units) estimate the move ended with.
-        Must run in movie mode.
+        sizes, focal length), the trace being each nudge sent and the
+        read-back after it, the learned sizes the (size, units) estimate the
+        move ended with, and the focal length (mm) its table was picked for
+        (None: the flat table). Must run in movie mode.
 
         The stop reason says which exit ended the loop: "within_tolerance",
         "within_half_nudge", "hunting" (back and forth across the target, or
@@ -1792,23 +1809,53 @@ class CameraSession:
                     # A move cut short by a stop says nothing about the size.
                     seen.setdefault(size, []).append(float(abs(moved_to - pos)))
             pos = moved_to
-        return pos, nudges, reason, trace, learned
+        return pos, nudges, reason, trace, learned, zoom_mm
 
-    def _accept_tolerance(self, tolerance: int, accept: Optional[int]) -> int:
+    @staticmethod
+    def _accept_for_zoom(
+        windows: Dict[float, Optional[float]], mm: float, floor: float
+    ) -> float:
+        """The per-zoom near-miss window at focal length `mm`, the same way
+        `_nudge_table_for_zoom` picks a table: the nearest end outside the
+        calibrated range, a log-linear blend (in focal length) between two.
+        A None window is `floor` (the factor x tolerance), and the result is
+        never below it."""
+        points = sorted((f, floor if v is None else float(v)) for f, v in windows.items())
+        if mm <= points[0][0]:
+            value = points[0][1]
+        elif mm >= points[-1][0]:
+            value = points[-1][1]
+        else:
+            value = points[-1][1]
+            for (f1, v1), (f2, v2) in zip(points, points[1:]):
+                if f1 <= mm <= f2:
+                    t = math.log(mm / f1) / math.log(f2 / f1)
+                    value = (1 - t) * v1 + t * v2
+                    break
+        return max(value, floor)
+
+    def _accept_tolerance(
+        self, tolerance: int, accept: Optional[int], zoom_mm: Optional[float] = None
+    ) -> int:
         """The near-miss window: the per-call value, else the configured one,
+        else the per-zoom default at `zoom_mm` (`movie_focus_accept_by_zoom`),
         else `_DEFAULT_FOCUS_ACCEPT_FACTOR` x the tolerance in force. Never
         narrower than the tolerance itself."""
+        floor = _DEFAULT_FOCUS_ACCEPT_FACTOR * tolerance
         if accept is None:
             accept = self._config.movie_focus_accept_tolerance
+        if accept is None and zoom_mm is not None and self._config.movie_focus_accept_by_zoom:
+            accept = int(round(
+                self._accept_for_zoom(self._config.movie_focus_accept_by_zoom, zoom_mm, floor)
+            ))
         if accept is None:
-            accept = int(round(_DEFAULT_FOCUS_ACCEPT_FACTOR * tolerance))
+            accept = int(round(floor))
         return max(int(accept), int(tolerance))
 
     def _do_set_focus_movie(
         self, target: int, tolerance: int, accept: Optional[int] = None
     ) -> Dict[str, Any]:
         self._require_near_far()
-        accept = self._accept_tolerance(tolerance, accept)
         clamped = max(0, min(int(target), _FOLLOW_FOCUS_MAX))
         if clamped != target:
             self._log(
@@ -1817,9 +1864,10 @@ class CameraSession:
                 f"(valid range 0..{_FOLLOW_FOCUS_MAX})",
             )
         known, self._movie_known = self._movie_known, None
-        position, nudges, reason, trace, learned = self._in_movie(
+        position, nudges, reason, trace, learned, zoom_mm = self._in_movie(
             lambda: self._movie_drive(clamped, tolerance, known)
         )
+        accept = self._accept_tolerance(tolerance, accept, zoom_mm)
         self._movie_known = position
         self._state_cache = None
         miss = abs(position - clamped)

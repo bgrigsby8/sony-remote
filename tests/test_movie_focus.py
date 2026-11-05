@@ -529,14 +529,15 @@ class ZoomLens:
 
 @pytest.fixture
 def zoomed(movie_session, fake):
-    """A session with the module's default per-zoom tables, the fake lens
-    zoomed to `mm`."""
-    from session import _DEFAULT_MOVIE_NUDGE_UNITS_BY_ZOOM
+    """A session with the module's default per-zoom tables and near-miss
+    windows, the fake lens zoomed to `mm`."""
+    from session import _DEFAULT_FOCUS_ACCEPT_BY_ZOOM, _DEFAULT_MOVIE_NUDGE_UNITS_BY_ZOOM
 
     def build(mm, **overrides):
         config = dict(
             movie_nudge_units=MEASURED_UNITS,
             movie_nudge_units_by_zoom=dict(_DEFAULT_MOVIE_NUDGE_UNITS_BY_ZOOM),
+            movie_focus_accept_by_zoom=dict(_DEFAULT_FOCUS_ACCEPT_BY_ZOOM),
             movie_max_nudge_size=6,
         )
         config.update(overrides)
@@ -610,10 +611,10 @@ class TestZoomTables:
         table = _DEFAULT_MOVIE_NUDGE_UNITS_BY_ZOOM[float(mm)]
         lens = ZoomLens(start, measured, table, growth).install(session, monkeypatch)
         # At 16mm a size-2 nudge is ~1700, so the closest reachable position
-        # can be ~850 off - just outside the provisional default accept window
-        # (2 x 400). The accept window is Step 1.3's call; here it is set
-        # wide enough to show every landing is the best the steps allow.
-        result = session.set_focus_position(40000, accept_tolerance=1000)
+        # can be ~850 off: the 16mm default near-miss window (1000) covers it;
+        # 35mm keeps 2 x tolerance.
+        result = session.set_focus_position(40000)
+        assert result["accept_tolerance"] == {16: 1000, 35: 800}[mm]
 
         assert result["stop_reason"] in ("within_tolerance", "within_half_nudge"), (
             lens.path, result,
@@ -624,6 +625,41 @@ class TestZoomTables:
         # Inside the tolerance, or a near miss (ok, flagged) - never a failure.
         assert result["ok"] is True, (lens.path, result)
         assert result["near_miss"] == (result["miss"] > 400)
+
+
+class TestAcceptByZoom:
+    @pytest.mark.parametrize(
+        "zoom,tolerance,window",
+        [
+            (16, 400, 1000),
+            (35, 400, 800),   # 35mm: 2 x tolerance
+            (12, 400, 1000),  # outside the range: the nearest end
+            (50, 400, 800),
+            (16, 600, 1200),  # never below 2 x tolerance
+            (35, 100, 200),
+        ],
+    )
+    def test_the_default_window_follows_the_focal_length(self, zoomed, zoom, tolerance, window):
+        session = zoomed(zoom)
+        assert session._accept_tolerance(tolerance, None, float(zoom)) == window
+
+    def test_between_focal_lengths_it_blends(self, zoomed):
+        session = zoomed(24)
+        t = math.log(24 / 16) / math.log(35 / 16)
+        assert session._accept_tolerance(400, None, 24.0) == round((1 - t) * 1000 + t * 800)
+
+    def test_no_focal_length_is_the_factor(self, zoomed):
+        assert zoomed(16)._accept_tolerance(400, None, None) == 800
+
+    def test_the_attribute_and_the_call_win(self, zoomed):
+        session = zoomed(16, movie_focus_accept_tolerance=600)
+        assert session._accept_tolerance(400, None, 16.0) == 600
+        assert session._accept_tolerance(400, 900, 16.0) == 900
+
+    def test_a_move_at_16mm_reports_the_16mm_window(self, zoomed, monkeypatch):
+        session = zoomed(16)
+        ZoomLens(39000, RIG_16MM, MEASURED_UNITS).install(session, monkeypatch)
+        assert session.set_focus_position(40000)["accept_tolerance"] == 1000
 
 
 class TestFallback:

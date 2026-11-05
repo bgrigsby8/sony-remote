@@ -483,3 +483,21 @@ class TestNudgeUnitsByZoom:
         Camera.validate_config(
             make_config(movie_nudge_units_by_zoom={"16": [0, 1690, 4160, 10980, 1, 2, 3]})
         )
+
+
+class TestAcceptByZoomPlumbing:
+    def test_the_built_in_tables_bring_their_windows(self, camera):
+        from session import _DEFAULT_FOCUS_ACCEPT_BY_ZOOM
+
+        assert camera._session_config.movie_focus_accept_by_zoom == _DEFAULT_FOCUS_ACCEPT_BY_ZOOM
+
+    @pytest.mark.parametrize(
+        "attrs",
+        [
+            {"movie_nudge_units_by_zoom": {"18": [0, 1, 2, 3, 4, 5, 6]}},
+            {"movie_nudge_units": [0, 1, 2, 3, 4, 5, 6]},
+        ],
+    )
+    def test_own_tables_do_not(self, camera, capture_dir, attrs):
+        camera.reconfigure(make_config(capture_dir=capture_dir, binding="fake", **attrs), {})
+        assert camera._session_config.movie_focus_accept_by_zoom == {}

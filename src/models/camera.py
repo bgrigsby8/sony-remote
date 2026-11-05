@@ -60,6 +60,7 @@ import settings as settings_mod
 from binding import CameraError, make_binding
 from models.commands import CommandHandler
 from session import (
+    _DEFAULT_FOCUS_ACCEPT_BY_ZOOM,
     _DEFAULT_MOVIE_NUDGE_UNITS,
     _DEFAULT_MOVIE_NUDGE_UNITS_BY_ZOOM,
     CameraSession,
@@ -373,6 +374,14 @@ class Camera(CameraBase, EasyResource):
             movie_units_per_nudge=float(attr("movie_units_per_nudge")),
             movie_nudge_units=tuple(float(u) for u in attr("movie_nudge_units")),
             movie_nudge_units_by_zoom=_nudge_units_by_zoom(attrs),
+            # The built-in per-zoom near-miss windows (16mm: 1000) belong to
+            # the built-in tables: a config with its own tables doesn't get them.
+            movie_focus_accept_by_zoom=(
+                dict(_DEFAULT_FOCUS_ACCEPT_BY_ZOOM)
+                if attrs.get("movie_nudge_units_by_zoom") is None
+                and attrs.get("movie_nudge_units") is None
+                else {}
+            ),
             movie_max_nudge_size=int(attr("movie_max_nudge_size")),
             movie_read_timeout_s=float(attr("movie_read_timeout_s")),
             movie_read_stable_s=float(attr("movie_read_stable_s")),
