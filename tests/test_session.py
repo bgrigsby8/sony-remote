@@ -438,7 +438,67 @@ class TestCapture:
         with pytest.raises(CaptureTimeoutError) as exc:
             session.capture()
         assert str(exc.value).startswith("[timeout]")
-        assert "capture_timeout_s" in str(exc.value)
+
+    def test_timeout_without_a_shutter_event_says_the_shutter_never_fired(
+        self, make_session, logger
+    ):
+        # CONSULT-2301: the body never sent 0x20011, yet the error used to
+        # claim "the shutter was released".
+        fake = FakeCamera(drop_capture=True)
+        session = make_session(fake, capture_timeout_s=0.4)
+        assert wait_until(lambda: session.connected)
+
+        with pytest.raises(CaptureTimeoutError) as exc:
+            session.capture()
+        message = str(exc.value)
+        assert "never reported the shutter firing" in message
+        assert "hot shoe" in message
+        assert "shutter was released" not in message
+        # Logged in this module's own log, not only the caller's.
+        assert "capture timed out" in logger.text("warning")
+        assert "never reported the shutter firing" in logger.text("warning")
+
+    def test_timeout_after_a_shutter_event_keeps_the_missing_file_text(
+        self, make_session, logger
+    ):
+        fake = FakeCamera(drop_capture=True)
+        session = make_session(fake, capture_timeout_s=0.4)
+        assert wait_until(lambda: session.connected)
+
+        def fire():
+            time.sleep(0.05)
+            fake.push_event("warning", value=0x20011)
+
+        threading.Thread(target=fire, daemon=True).start()
+        with pytest.raises(CaptureTimeoutError) as exc:
+            session.capture()
+        message = str(exc.value)
+        assert "shutter was released" in message
+        assert "capture_timeout_s" in message
+        assert "never reported" not in message
+        assert "capture timed out" in logger.text("warning")
+
+    def test_a_shutter_event_from_before_the_trigger_does_not_count(
+        self, make_session, fake
+    ):
+        session = make_session(fake, capture_timeout_s=0.4)
+        assert wait_until(lambda: session.connected)
+        # A straggler 0x20011 queued while idle is flushed before the trigger
+        # and must not make the next timeout claim the shutter fired.
+        fake.push_event("warning", value=0x20011)
+        fake.drop_capture = True
+        with pytest.raises(CaptureTimeoutError) as exc:
+            session.capture()
+        assert "never reported the shutter firing" in str(exc.value)
+
+    def test_a_shutter_event_does_not_change_a_successful_capture(
+        self, make_session, fake
+    ):
+        session = make_session(fake)
+        assert wait_until(lambda: session.connected)
+        fake.push_event("warning", value=0x20011)
+        result = session.capture()
+        assert os.path.exists(result["path"])
 
     def test_timeout_after_a_completed_exposure_blames_the_save_destination(
         self, make_session

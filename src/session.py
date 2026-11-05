@@ -382,6 +382,10 @@ class CameraSession:
         self._capturing = False
         self._capture_files: List[str] = []
         self._capture_complete = False
+        # Whether the body sent `0x20011 CrNotify_Captured_Event` ("the shutter
+        # fired") during this capture. Used only to word a timeout honestly;
+        # it never decides whether a capture succeeded.
+        self._shutter_fired = False
 
         # Property reads are USB round trips, and a capture wants a full
         # settings snapshot for the audit log. Cache it, and let a
@@ -1024,6 +1028,8 @@ class CameraSession:
             # that report success or a changed list of choices go to debug so
             # they don't read as faults.
             value = event.data.get("value")
+            if self._capturing and value == _CAPTURED_EVENT:
+                self._shutter_fired = True
             level = "debug" if _camera_warning_is_informational(value) else "warning"
             self._log(level, f"camera warning: {_describe_camera_warning(value)}")
             return
@@ -1075,6 +1081,7 @@ class CameraSession:
         before = self._store.snapshot()
         self._capture_files = []
         self._capture_complete = False
+        self._shutter_fired = False
         self._capturing = True
         try:
             self._binding.trigger_capture()
@@ -1224,19 +1231,35 @@ class CameraSession:
             # The exposure finished but nothing reached the host. Almost always
             # the save destination: the body is writing to its card instead of
             # to us, which `set_save_destination` at connect is supposed to fix.
-            raise CaptureTimeoutError(
+            message = (
                 "the exposure completed but no file reached "
                 f"{self._config.capture_dir}. The body is most likely saving to "
                 "its card rather than to the host - check that PC Remote save "
                 "destination is set to the PC, and that the card isn't in an "
                 "error state"
             )
-        raise CaptureTimeoutError(
-            "no file appeared in "
-            f"{self._config.capture_dir} within the capture timeout. The shutter "
-            "was released; check that a card error isn't blocking the write, and "
-            "that `capture_timeout_s` allows for the exposure time"
-        )
+        elif self._shutter_fired:
+            message = (
+                "no file appeared in "
+                f"{self._config.capture_dir} within the capture timeout. The "
+                "shutter was released; check that a card error isn't blocking "
+                "the write, and that `capture_timeout_s` allows for the exposure "
+                "time"
+            )
+        else:
+            # The SDK sends 0x20011 for every real shot, so its absence means
+            # the trigger was sent but the body never fired - not a lost file.
+            message = (
+                "no file appeared in "
+                f"{self._config.capture_dir} within the capture timeout, and the "
+                "camera never reported the shutter firing (no 0x20011 "
+                "CrNotify_Captured_Event); check the flash trigger on the hot "
+                "shoe and that the body is awake"
+            )
+        # The caller logs this too, but only in its own log; leave a record in
+        # ours so a timeout is visible from the camera module alone.
+        self._log("warning", f"capture timed out: {message}")
+        raise CaptureTimeoutError(message)
 
     def _choose_candidates(
         self, diffed: List[str], named: List[str], expected: int
@@ -2320,6 +2343,10 @@ def _file_size(path: str) -> int:
         return os.path.getsize(path)
     except OSError:
         return 0
+
+
+# `CrNotify_Captured_Event`: the body reports one per real shutter release.
+_CAPTURED_EVENT = 0x20011
 
 
 def _describe_camera_warning(value: Any) -> str:
