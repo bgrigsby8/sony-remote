@@ -8,6 +8,8 @@ tests run that against the fake's physical model: positions in follow-focus
 units, 0 = near stop .. 65535 = far stop.
 """
 
+import math
+
 import pytest
 
 from binding import ConfigurationError, SDKError
@@ -491,6 +493,137 @@ class TestAcceptTolerance:
         result = session.set_focus_position(TICKET_TARGET, tolerance=700, accept_tolerance=100)
         assert result["accept_tolerance"] == 700
         assert result["ok"] is True and result["near_miss"] is False
+
+
+# Step 1.1 of CONSULT-2297, measured on the rig 2026-11-05: |movement| medians
+# per nudge size at the two zooms the products shoot at.
+RIG_16MM = {2: 1690, 3: 4160, 4: 10980}
+RIG_35MM = {2: 354, 3: 995, 4: 2878}
+
+
+class ZoomLens:
+    """A lens with the rig's measured nudge sizes at one zoom: sizes 2-4 the
+    medians, the others the module's table for that zoom (not measured), and
+    each move `growth` larger per unit of position above 40000 (size 2 at
+    16mm ran ~1555 at 29k and ~1850 at 50k). Read back instantly."""
+
+    def __init__(self, start, measured, table, growth=0.0):
+        self.pos = start
+        self.units = {s: table[s - 1] for s in range(1, 8)}
+        self.units.update(measured)
+        self.growth = growth
+        self.steps = []
+        self.path = [start]
+
+    def nudge(self, step):
+        self.steps.append(step)
+        travel = self.units[abs(step)] * (1 + self.growth * (self.pos - 40000))
+        self.pos = max(0, min(0xFFFF, round(self.pos + (1 if step > 0 else -1) * travel)))
+        self.path.append(self.pos)
+
+    def install(self, session, monkeypatch):
+        monkeypatch.setattr(session, "_nudge_focus", self.nudge)
+        monkeypatch.setattr(session, "_movie_read_once", lambda: self.pos)
+        return self
+
+
+@pytest.fixture
+def zoomed(movie_session, fake):
+    """A session with the module's default per-zoom tables, the fake lens
+    zoomed to `mm`."""
+    from session import _DEFAULT_MOVIE_NUDGE_UNITS_BY_ZOOM
+
+    def build(mm, **overrides):
+        config = dict(
+            movie_nudge_units=MEASURED_UNITS,
+            movie_nudge_units_by_zoom=dict(_DEFAULT_MOVIE_NUDGE_UNITS_BY_ZOOM),
+            movie_max_nudge_size=6,
+        )
+        config.update(overrides)
+        session = movie_session(**config)
+        fake._zoom_um = float(mm * 1000)
+        return session
+
+    return build
+
+
+class TestZoomTables:
+    def test_the_table_follows_the_focal_length(self, zoomed, fake):
+        from session import _NUDGE_UNITS_16MM, _NUDGE_UNITS_35MM
+
+        session = zoomed(16)
+        assert session._nudge_table() == (_NUDGE_UNITS_16MM, 16.0)
+        fake._zoom_um = 35000.0
+        assert session._nudge_table() == (_NUDGE_UNITS_35MM, 35.0)
+        # Outside the calibrated range: the nearest end.
+        fake._zoom_um = 12000.0
+        assert session._nudge_table()[0] == _NUDGE_UNITS_16MM
+        # Between: every moving size strictly between the two, log-linear.
+        fake._zoom_um = 24000.0
+        mid, mm = session._nudge_table()
+        assert mm == 24.0
+        for a, m, b in zip(_NUDGE_UNITS_35MM, mid, _NUDGE_UNITS_16MM):
+            assert (a == m == b == 0) or a < m < b
+        t = math.log(24 / 16) / math.log(35 / 16)
+        assert mid[1] == pytest.approx(math.exp((1 - t) * math.log(1690) + t * math.log(354)))
+
+    def test_no_focal_length_or_no_tables_falls_back_to_the_flat_table(
+        self, zoomed, movie_session, fake
+    ):
+        session = zoomed(16)
+        fake.power_zoom = False
+        assert session._nudge_table() == (tuple(MEASURED_UNITS), None)
+
+    def test_without_tables_the_flat_table_is_used(self, movie_session):
+        session = movie_session(movie_nudge_units=MEASURED_UNITS)
+        assert session._nudge_table() == (tuple(MEASURED_UNITS), None)
+
+    def test_at_16mm_a_short_move_is_one_size_2_nudge(self, zoomed, monkeypatch):
+        from session import CameraSession
+
+        # The 35mm-ish flat table would send a size 3 here (693 <= 1000) -
+        # 4160 units at 16mm, overshooting by 3000 and starting the hunt.
+        flat = [(s, float(u)) for s, u in enumerate(MEASURED_UNITS, 1) if u > 0]
+        assert CameraSession._pick_nudge(flat, 1000, 6) == 3
+
+        for start, target in ((39000, 40000), (41000, 40000)):
+            session = zoomed(16)
+            lens = ZoomLens(start, RIG_16MM, MEASURED_UNITS).install(session, monkeypatch)
+            result = session.set_focus_position(target)
+            assert lens.steps[0] in (2, -2), lens.steps
+            assert result["attempts"] == 1, lens.steps
+            assert result["ok"] is True and result["stop_reason"] != "hunting", result
+
+    @pytest.mark.parametrize(
+        "start", [8000, 20000, 30000, 37000, 38500, 39300, 40700, 41500, 43000, 50000, 59142]
+    )
+    @pytest.mark.parametrize(
+        # 16mm growth: size 2 ran ~1555 at 29k and ~1850 at 50k, ~9e-6 per unit.
+        "mm,measured,growth", [(16, RIG_16MM, 9e-6), (35, RIG_35MM, 0.0)]
+    )
+    def test_the_rig_lens_lands_from_both_sides_of_40000(
+        self, zoomed, monkeypatch, mm, measured, growth, start
+    ):
+        from session import _DEFAULT_MOVIE_NUDGE_UNITS_BY_ZOOM
+
+        session = zoomed(mm)
+        table = _DEFAULT_MOVIE_NUDGE_UNITS_BY_ZOOM[float(mm)]
+        lens = ZoomLens(start, measured, table, growth).install(session, monkeypatch)
+        # At 16mm a size-2 nudge is ~1700, so the closest reachable position
+        # can be ~850 off - just outside the provisional default accept window
+        # (2 x 400). The accept window is Step 1.3's call; here it is set
+        # wide enough to show every landing is the best the steps allow.
+        result = session.set_focus_position(40000, accept_tolerance=1000)
+
+        assert result["stop_reason"] in ("within_tolerance", "within_half_nudge"), (
+            lens.path, result,
+        )
+        # As close as the smallest nudge allows: within half of one (10%
+        # margin for the position growth), so another would land further off.
+        assert result["miss"] <= max(400, 1.1 * lens.units[2] / 2), (lens.path, result)
+        # Inside the tolerance, or a near miss (ok, flagged) - never a failure.
+        assert result["ok"] is True, (lens.path, result)
+        assert result["near_miss"] == (result["miss"] > 400)
 
 
 class TestFallback:

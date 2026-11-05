@@ -27,6 +27,7 @@ exponential backoff, so a camera that is unplugged, power-cycled or plugged in
 ten minutes after viam-server started all end up in the same place.
 """
 
+import math
 import os
 import queue
 import statistics
@@ -143,6 +144,27 @@ _FOCUS_READ_POLL_S = 0.05
 # both directions). Size 1 does not move this lens at all, and each size above
 # moves ~2.5-3x the one below; size 7 runs for seconds, often into a stop.
 _DEFAULT_MOVIE_NUDGE_UNITS = (0.0, 382.0, 693.0, 2329.0, 6470.0, 18893.0, 40000.0)
+# The same nudges depend heavily on zoom (CONSULT-2297). Re-measured on the rig
+# 2026-11-05 (trace_focus_read after one nudge, both directions, starts
+# 30000/40000/50000/59142; medians of |movement|):
+#   35mm (outfits): size 2 354 (295-493), 3 995 (783-1250), 4 2878 (1900-3347)
+#   16mm (shoes):   size 2 1690 (1555-1938), 3 4160 (3141-4780),
+#                   4 10980 (9239-12979) - 4.4x/6x/4.7x the table above, and
+#                   growing mildly with position (size 2: ~1555 at 29k, ~1850
+#                   at 50k).
+# Sizes 1 and 5-7 were not re-measured: at 35mm they keep the 2026-10-27
+# table (evidently measured near 35mm); at 16mm they are EXTRAPOLATED, the
+# 35mm values x4.7. The closed loop re-learns every size it sends anyway.
+_NUDGE_UNITS_35MM = (0.0, 354.0, 995.0, 2878.0, 6470.0, 18893.0, 40000.0)
+_NUDGE_UNITS_16MM = (0.0, 1690.0, 4160.0, 10980.0, 30409.0, 88797.0, 188000.0)
+# Focal length (mm) -> units per nudge size 1..7. Between two calibrated focal
+# lengths the table is interpolated log-linearly (in log focal length and log
+# units: the sizes scale by a factor, not an offset); outside them the nearest
+# one is used. See `_nudge_table_for_zoom`.
+_DEFAULT_MOVIE_NUDGE_UNITS_BY_ZOOM: Dict[float, Tuple[float, ...]] = {
+    16.0: _NUDGE_UNITS_16MM,
+    35.0: _NUDGE_UNITS_35MM,
+}
 # Closed-loop give-ups, so a move ends in ok=false rather than the job
 # timeout: direction reversals (hunting around a target narrower than the
 # smallest nudge), and nudges in a row that didn't move the lens (each retried
@@ -304,6 +326,12 @@ class SessionConfig:
     # The closed loop picks the largest size that doesn't overshoot; a size
     # listed as 0 (size 1 on the FE PZ 16-35) is never used.
     movie_nudge_units: Tuple[float, ...] = _DEFAULT_MOVIE_NUDGE_UNITS
+    # Per-focal-length tables (mm -> 7 units), picked by the lens's current
+    # zoom_distance at the start of each move (see `_nudge_table_for_zoom`).
+    # Empty, or a lens that doesn't report a focal length: `movie_nudge_units`.
+    # The module's default is `_DEFAULT_MOVIE_NUDGE_UNITS_BY_ZOOM` (camera.py);
+    # empty here so a bare SessionConfig keeps the flat table.
+    movie_nudge_units_by_zoom: Dict[float, Tuple[float, ...]] = field(default_factory=dict)
     # Largest nudge size the closed loop sends. Size 7 can run the lens for
     # seconds, into a stop, so it is off by default.
     movie_max_nudge_size: int = 6
@@ -1560,10 +1588,48 @@ class CameraSession:
             return self._movie_read()
         return self._movie_read(previous=self._movie_read_once())
 
-    def _nudge_sizes(self) -> List[Tuple[int, float]]:
+    @staticmethod
+    def _nudge_table_for_zoom(
+        tables: Dict[float, Tuple[float, ...]], mm: float
+    ) -> Tuple[float, ...]:
+        """The nudge table at focal length `mm`: the calibrated table when `mm`
+        is one, the nearest end one outside the calibrated range, and between
+        two a log-linear blend - each size's units interpolated in log units
+        against log focal length (a size listed as 0 at either end blends
+        linearly, so 0 at both stays 0)."""
+        points = sorted(tables.items())
+        if mm <= points[0][0]:
+            return tuple(points[0][1])
+        if mm >= points[-1][0]:
+            return tuple(points[-1][1])
+        for (f1, u1), (f2, u2) in zip(points, points[1:]):
+            if f1 <= mm <= f2:
+                t = math.log(mm / f1) / math.log(f2 / f1)
+                return tuple(
+                    math.exp((1 - t) * math.log(a) + t * math.log(b))
+                    if a > 0 and b > 0
+                    else (1 - t) * a + t * b
+                    for a, b in zip(u1, u2)
+                )
+        return tuple(points[-1][1])  # unreachable: mm lies in some interval
+
+    def _nudge_table(self) -> Tuple[Tuple[float, ...], Optional[float]]:
+        """(units per nudge size 1..7, focal length it was picked for). From
+        `movie_nudge_units_by_zoom` at the lens's current focal length, else
+        (no tables, or no focal length to read) `movie_nudge_units` and None."""
+        tables = self._config.movie_nudge_units_by_zoom
+        if tables:
+            prop = self._read_optional("zoom_distance")
+            if prop is not None and prop.value is not None and int(prop.value) > 0:
+                mm = int(prop.value) / 1000.0
+                return self._nudge_table_for_zoom(tables, mm), mm
+        return tuple(self._config.movie_nudge_units), None
+
+    def _nudge_sizes(self, table: Optional[Tuple[float, ...]] = None) -> List[Tuple[int, float]]:
         """(size, units) for every nudge size the closed loop may send: one
-        that moves the lens, up to `movie_max_nudge_size`."""
-        table = list(self._config.movie_nudge_units)[:7]
+        that moves the lens, up to `movie_max_nudge_size`. `table` defaults to
+        `movie_nudge_units`."""
+        table = list(self._config.movie_nudge_units if table is None else table)[:7]
         limit = max(1, min(7, int(self._config.movie_max_nudge_size)))
         sizes = [(s, float(u)) for s, u in enumerate(table, start=1) if u > 0 and s <= limit]
         if not sizes:
@@ -1627,7 +1693,9 @@ class CameraSession:
 
         Each nudge is the largest size that doesn't move further than the
         distance left (sizes grow ~3x per step, so scaling one size linearly
-        overshoots badly). Sizes start from `movie_nudge_units` and are
+        overshoots badly). Sizes start from the table for the lens's current
+        focal length (`_nudge_table`: `movie_nudge_units_by_zoom`, else
+        `movie_nudge_units`) and are
         re-estimated from every read-back during the move (`_learned_sizes`):
         the table was measured at one zoom, and at another a nudge can travel
         several times as far. An overshoot caps the size below the one that
@@ -1643,7 +1711,14 @@ class CameraSession:
         closer of the last two positions, nudging back once if that is the one
         it just left. Either way the caller judges the read-back.
         """
-        sizes = self._nudge_sizes()
+        table, zoom_mm = self._nudge_table()
+        sizes = self._nudge_sizes(table)
+        if zoom_mm is not None:
+            self._log(
+                "debug",
+                f"focus nudge table for {zoom_mm:g}mm: "
+                + ", ".join(f"{s}:{u:.0f}" for s, u in sizes),
+            )
         largest = max(s for s, _ in sizes)
         start = pos = self._movie_first_read(known)
         nudges = stalls = reversals = 0

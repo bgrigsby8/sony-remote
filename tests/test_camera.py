@@ -103,6 +103,10 @@ class TestValidateConfig:
             ({"focus_method": "movie", "movie_focus_fallback": "af"}, "movie_focus_fallback"),
             ({"movie_focus_tolerance": -1}, "movie_focus_tolerance"),
             ({"movie_focus_accept_tolerance": -1}, "movie_focus_accept_tolerance"),
+            ({"movie_nudge_units_by_zoom": [1, 2]}, "movie_nudge_units_by_zoom"),
+            ({"movie_nudge_units_by_zoom": {"wide": [0, 1, 2, 3, 4, 5, 6]}}, "movie_nudge_units_by_zoom"),
+            ({"movie_nudge_units_by_zoom": {"16": [1, 2, 3]}}, "movie_nudge_units_by_zoom"),
+            ({"movie_nudge_units_by_zoom": {"16": [0, -1, 2, 3, 4, 5, 6]}}, "movie_nudge_units_by_zoom"),
             ({"movie_mode_timeout_s": 0}, "movie_mode_timeout_s"),
             ({"movie_units_per_nudge": 0}, "movie_units_per_nudge"),
             ({"movie_max_nudges": 0}, "movie_max_nudges"),
@@ -450,3 +454,32 @@ class TestZoomDispatch:
             await camera.do_command(
                 {"set_property_raw": {"name": "zoom_operation", "value": -1, "value_type": "0x2002"}}
             )
+
+
+class TestNudgeUnitsByZoom:
+    def test_defaults_to_the_built_in_tables(self):
+        from models.camera import _nudge_units_by_zoom
+        from session import _DEFAULT_MOVIE_NUDGE_UNITS_BY_ZOOM
+
+        assert _nudge_units_by_zoom({}) == _DEFAULT_MOVIE_NUDGE_UNITS_BY_ZOOM
+
+    def test_a_config_table_is_read_by_focal_length(self):
+        from models.camera import _nudge_units_by_zoom
+
+        tables = {"18": [0, 1, 2, 3, 4, 5, 6], "50": [0, 2, 4, 6, 8, 10, 12]}
+        assert _nudge_units_by_zoom({"movie_nudge_units_by_zoom": tables}) == {
+            18.0: (0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0),
+            50.0: (0.0, 2.0, 4.0, 6.0, 8.0, 10.0, 12.0),
+        }
+
+    def test_an_own_flat_table_turns_the_built_in_ones_off(self):
+        from models.camera import _nudge_units_by_zoom
+
+        assert _nudge_units_by_zoom({"movie_nudge_units": [0, 1, 2, 3, 4, 5, 6]}) == {}
+        # Unless it names per-zoom tables too; {} turns them off explicitly.
+        assert _nudge_units_by_zoom({"movie_nudge_units_by_zoom": {}}) == {}
+
+    def test_a_valid_table_validates(self):
+        Camera.validate_config(
+            make_config(movie_nudge_units_by_zoom={"16": [0, 1690, 4160, 10980, 1, 2, 3]})
+        )

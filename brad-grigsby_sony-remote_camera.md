@@ -62,6 +62,7 @@ Every attribute is optional.
 | `movie_focus_accept_tolerance` | number | 2 × tolerance | Near-miss window, in follow-focus units. A read-back outside `movie_focus_tolerance` but within this returns `ok: true` with `near_miss: true` and a `warning`, so the caller can shoot and flag the frame. Unset = 2 × the tolerance in force (provisional, CONSULT-2297). Never narrower than the tolerance. Overridable per call (`accept_tolerance`). |
 | `movie_mode_timeout_s` | number | `5` | Longest wait for a stills↔movie switch, and for the lens to start publishing its position. |
 | `movie_nudge_units` | list | `[0, 382, 693, 2329, 6470, 18893, 40000]` | Follow-focus units one nudge of each size 1–7 moves the lens: the closed loop sends the largest size that won't overshoot. Defaults measured on the FE PZ 16-35 (2026-10-27). Size 1 doesn't move that lens, and a size listed as `0` is never used. Measure another lens with `focus_near_far` followed by two `get_focus_position` calls (the first is stale; see [Movie-mode focus](#movie-mode-focus)). |
+| `movie_nudge_units_by_zoom` | object | `{"16": [0, 1690, 4160, 10980, 30409, 88797, 188000], "35": [0, 354, 995, 2878, 6470, 18893, 40000]}` | Per-focal-length versions of `movie_nudge_units` (keys in mm). On the FE PZ 16-35 a nudge moves focus ~4-6× further at 16mm than at 35mm (CONSULT-2297), so each move picks the table for the lens's current focal length: the calibrated one, the nearest end outside the calibrated range, or a log-linear blend between two. Defaults measured on the rig 2026-11-05 for sizes 2-4; at 16mm sizes 5-7 are extrapolated (35mm × 4.7). Used whenever the lens reports a focal length; `{}` turns it off. A config that sets its own `movie_nudge_units` and not this gets no per-zoom tables. |
 | `movie_max_nudge_size` | number | `6` | Largest nudge size the closed loop sends. Size 7 can run the lens for seconds, into a stop. |
 | `movie_read_timeout_s` | number | `4` | After a nudge, how long a read waits for the body to publish the move. |
 | `movie_read_stable_s` | number | `1` | How long the published position must hold still before it is trusted (a long move publishes intermediate positions). |
@@ -206,9 +207,10 @@ read last in movie mode. With `focus_method: "movie"` every focus command:
 2. reads it, and for `set_focus_position` nudges near/far in a closed loop until
    the read-back is within `movie_focus_tolerance` (each nudge is the largest
    size in `movie_nudge_units` that won't overshoot; an overshoot steps the
-   size down). The table is only the starting guess: every read-back updates
-   how far each size really moves during that move, because at some zooms a
-   nudge runs several times the table (CONSULT-2297). Once the lens is within
+   size down). The table is picked for the lens's current focal length
+   (`movie_nudge_units_by_zoom`): at 16mm a nudge moves focus ~4-6× as far
+   as at 35mm (CONSULT-2297). It is still only the starting guess: every
+   read-back updates how far each size really moves during that move. Once the lens is within
    half the smallest nudge (as measured), another would only land further
    away, so it stops there rather than hunting. If it still goes back and
    forth across the target, it stops at the closer of the two positions. A
